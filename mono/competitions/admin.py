@@ -41,18 +41,6 @@ class GroupConcat(Aggregate):
             **extra,
         )
 
-
-class TeamMemberInline(admin.TabularInline):
-    model = TeamMember
-    extra = 0
-    fields = (
-        "first_name", "last_name", "email", "phone_number",
-        "university_name", "student_number", "approval_status"
-    )
-    readonly_fields = ("approval_status",)
-    show_change_link = True
-
-
 class UnivUniquenessFilter(admin.SimpleListFilter):
     title = "university names unique?"
     parameter_name = "univ_unique"
