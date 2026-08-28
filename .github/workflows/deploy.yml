@@ -2,7 +2,8 @@ name: Backend CI/CD (Docker Hub)
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,7 +43,7 @@ jobs:
 
   deploy:
     needs: build-and-push
-    runs-on: [self-hosted, deploy-acm-2025]
+    runs-on: [self-hosted, deploy-acm-2026]
     steps:
       - name: Pull & restart services
         env:
@@ -52,8 +53,6 @@ jobs:
         run: |
           set -e
           cd "$SERVER_PATH"
-          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          docker compose pull
-          docker compose down
+          docker compose pull backend
           docker compose up -d
           docker system prune -f

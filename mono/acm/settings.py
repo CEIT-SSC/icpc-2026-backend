@@ -17,7 +17,8 @@ else:
     print(f"[settings] WARNING: .env not found at {ENV_FILE}")
 
 # Quick-start development settings - unsuitable for production
-SECRET_KEY = env('SECRET_KEY', default='django-insecure-wci8i*h_0lxjng1cw!mi0taj4v)h2z=b03-a6s8pliv573m!bd')
+SECRET_KEY = env(
+    'SECRET_KEY', default='django-insecure-wci8i*h_0lxjng1cw!mi0taj4v)h2z=b03-a6s8pliv573m!bd')
 DEBUG = False
 
 ALLOWED_HOSTS = ['*']
@@ -55,12 +56,17 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
 ]
 
-ZARINPAL_MERCHANT_ID = env("ZARINPAL_MERCHANT_ID", default="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-PAYMENT_CALLBACK_BASE = env("PAYMENT_CALLBACK_BASE", default="https://your-site.com/api/payment/callback/")
-PAYMENT_FRONTEND_RETURN = env("PAYMENT_FRONTEND_RETURN", default="https://your-frontend.example/payresult")
+ZARINPAL_MERCHANT_ID = env("ZARINPAL_MERCHANT_ID",
+                           default="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+PAYMENT_CALLBACK_BASE = env(
+    "PAYMENT_CALLBACK_BASE", default="https://your-site.com/api/payment/callback/")
+PAYMENT_FRONTEND_RETURN = env(
+    "PAYMENT_FRONTEND_RETURN", default="https://your-frontend.example/payresult")
 
-CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://127.0.0.1:6379/2")
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="redis://127.0.0.1:6379/3")
+CELERY_BROKER_URL = env("CELERY_BROKER_URL",
+                        default="redis://127.0.0.1:6379/2")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND",
+                            default="redis://127.0.0.1:6379/3")
 CELERY_TASK_ALWAYS_EAGER = False  # set True for local dev if you want sync
 CELERY_TASK_TIME_LIMIT = 30
 CELERY_TASK_SOFT_TIME_LIMIT = 25
@@ -76,9 +82,11 @@ EMAIL_PROVIDER = env("EMAIL_PROVIDER", default="smtp")
 EMAIL_HOST = env("EMAIL_HOST", default="smtp.gmail.com")
 EMAIL_PORT = env.int("EMAIL_PORT", default=587)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="your@gmail.com")
-EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="app-password-or-secret")
-EMAIL_USE_TLS = env.bool("EMAIL_USE_SSL", default=True)
-EMAIL_DEFAULT_FROM = env("EMAIL_DEFAULT_FROM", default="ACM <no-reply@yourdomain>")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD",
+                          default="app-password-or-secret")
+EMAIL_USE_SSL = env.bool("EMAIL_USE_SSL", default=True)
+EMAIL_DEFAULT_FROM = env("EMAIL_DEFAULT_FROM",
+                         default="ACM <no-reply@yourdomain>")
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -183,10 +191,10 @@ DATABASES = {
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',},
-    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',},
-    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',},
-    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',},
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator', },
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator', },
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator', },
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator', },
 ]
 
 # i18n
@@ -196,10 +204,14 @@ USE_I18N = True
 USE_TZ = True
 
 # S3 / static/media
-LIARA_ENDPOINT = os.getenv("AWS_S3_ENDPOINT_URL", default="BUCKET_ENDPOINT_DEFAULT")
-LIARA_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", default="BUCKET_NAME_DEFAULT")
-LIARA_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", default="BUCKET_ACCESS_KEY_DEFAULT")
-LIARA_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", default="BUCKET_SECRET_KEY_DEFAULT")
+LIARA_ENDPOINT = os.getenv("AWS_S3_ENDPOINT_URL",
+                           default="BUCKET_ENDPOINT_DEFAULT")
+LIARA_BUCKET_NAME = os.getenv(
+    "AWS_STORAGE_BUCKET_NAME", default="BUCKET_NAME_DEFAULT")
+LIARA_ACCESS_KEY = os.getenv(
+    "AWS_ACCESS_KEY_ID", default="BUCKET_ACCESS_KEY_DEFAULT")
+LIARA_SECRET_KEY = os.getenv(
+    "AWS_SECRET_ACCESS_KEY", default="BUCKET_SECRET_KEY_DEFAULT")
 
 AWS_ACCESS_KEY_ID = LIARA_ACCESS_KEY
 AWS_SECRET_ACCESS_KEY = LIARA_SECRET_KEY
@@ -284,5 +296,6 @@ SKYROOM_APIKEY = env("SKYROOM_APIKEY", default="")
 SKYROOM_ROOMID = env("SKYROOM_ROOMID", default="")
 
 # Competition
-COMPETITION_APPROVAL_REDIRECT_URL = env("COMPETITION_APPROVAL_REDIRECT_URL", default="https://aut-icpc.ir/DAMN")
+COMPETITION_APPROVAL_REDIRECT_URL = env(
+    "COMPETITION_APPROVAL_REDIRECT_URL", default="https://aut-icpc.ir/DAMN")
 PAYMENT_EMAIL_LINK_BASE_URL = env("PAYMENT_EMAIL_LINK_BASE_URL", default="")
