@@ -1,4 +1,5 @@
 import smtplib
+from email.utils import formataddr, parseaddr
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from django.conf import settings
@@ -13,11 +14,16 @@ class SmtpEmailProvider(EmailProvider):
         self.password = settings.EMAIL_HOST_PASSWORD
         self.use_ssl = settings.EMAIL_USE_SSL
         self.from_addr = settings.EMAIL_DEFAULT_FROM
+        self.from_name, self.envelope_from = parseaddr(self.from_addr)
+        if "@" not in self.envelope_from:
+            raise ValueError(
+                "EMAIL_DEFAULT_FROM must be an email address, optionally formatted as 'Name <email>'"
+            )
 
     def send(self, *, to: str, subject: str, html: str, text: str | None = None) -> None:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = self.from_addr
+        msg["From"] = formataddr((self.from_name, self.envelope_from))
         msg["To"] = to
 
         if text:
@@ -27,7 +33,7 @@ class SmtpEmailProvider(EmailProvider):
         server = smtplib.SMTP_SSL(self.host, self.port, timeout=20)
         try:
             server.login(self.user, self.password)
-            server.sendmail(self.from_addr, [to], msg.as_string())
+            server.sendmail(self.envelope_from, [to], msg.as_string())
         finally:
             try:
                 server.quit()
