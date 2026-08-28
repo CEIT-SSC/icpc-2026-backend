@@ -80,7 +80,7 @@ NOTIF_BULK_RETRY_BACKOFF = env.int("NOTIF_BULK_RETRY_BACKOFF", default=300)
 # Email (SMTP/Gmail)
 EMAIL_PROVIDER = env("EMAIL_PROVIDER", default="smtp")
 EMAIL_HOST = env("EMAIL_HOST", default="smtp.gmail.com")
-EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+EMAIL_PORT = env.int("EMAIL_PORT", default=465)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="your@gmail.com")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD",
                           default="app-password-or-secret")
