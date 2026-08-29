@@ -27,6 +27,8 @@ CSRF_TRUSTED_ORIGINS = [
     "https://www.aut-icpc.ir",
     "http://localhost:8000",
     "https://github.com",
+    "https://acpc.ceit-ssc.ir",
+    "https://ceit-ssc.ir",
 ]
 
 # Application definition
@@ -151,10 +153,10 @@ OTP_SECRET = env("OTP_SECRET", default="change-me-super-secret")
 REFRESH_TOKEN_COOKIE = {
     "key": "refresh_token",
     "httponly": True,
-    "secure": False,
+    "secure": True,
     "samesite": "Lax",
     "path": "/api/accounts/",
-    "domain": ".aut-icpc.ir",
+    "domain": ".ceit-ssc.ir",
 }
 
 ROOT_URLCONF = 'acm.urls'
@@ -259,28 +261,28 @@ OAUTH_STATE_COOKIE = {
     "key": "oauth_state",
     "max_age": 600,
     "httponly": True,
-    "secure": False,
+    "secure": True,
     "samesite": "Lax",
     "path": "/api/accounts/",
-    "domain": ".aut-icpc.ir",
+    "domain": ".ceit-ssc.ir",
 }
 OAUTH_NONCE_COOKIE = {
     "key": "oauth_nonce",
     "max_age": 600,
     "httponly": True,
-    "secure": False,
+    "secure": True,
     "samesite": "Lax",
     "path": "/api/accounts/",
-    "domain": ".aut-icpc.ir",
+    "domain": ".ceit-ssc.ir",
 }
 OAUTH_PKCE_COOKIE = {
     "key": "oauth_pkce",
     "max_age": 600,
     "httponly": True,
-    "secure": False,
+    "secure": True,
     "samesite": "Lax",
     "path": "/api/accounts/",
-    "domain": ".aut-icpc.ir",
+    "domain": ".ceit-ssc.ir",
 }
 
 # --- Codeforces OIDC (new) ---
@@ -288,7 +290,7 @@ CODEFORCES_OIDC_ISSUER = "https://codeforces.com"
 CODEFORCES_OIDC_DISCOVERY_URL = "https://codeforces.com/.well-known/openid-configuration"
 CODEFORCES_CLIENT_ID = env("CODEFORCES_CLIENT_ID", default="")
 CODEFORCES_CLIENT_SECRET = env("CODEFORCES_CLIENT_SECRET", default="")
-CODEFORCES_REDIRECT_URI = "https://aut-icpc.ir/api/accounts/codeforces/callback/"
+CODEFORCES_REDIRECT_URI = "https://acpc.ceit-ssc.ir/api/accounts/codeforces/callback/"
 
 # Skyroom
 SKYROOM_BASEURL = env("SKYROOM_BASEURL", default="")
@@ -297,5 +299,5 @@ SKYROOM_ROOMID = env("SKYROOM_ROOMID", default="")
 
 # Competition
 COMPETITION_APPROVAL_REDIRECT_URL = env(
-    "COMPETITION_APPROVAL_REDIRECT_URL", default="https://aut-icpc.ir/DAMN")
+    "COMPETITION_APPROVAL_REDIRECT_URL", default="https://acpc.ceit-ssc.ir/DAMN")
 PAYMENT_EMAIL_LINK_BASE_URL = env("PAYMENT_EMAIL_LINK_BASE_URL", default="")
