@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: backend-production-deploy
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: acpc-backend
   SERVER_PATH: /srv/stack
@@ -31,7 +35,7 @@ jobs:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=${{ github.sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -40,6 +44,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_REVISION=${{ github.sha }}
 
   deploy:
     needs: build-and-push
@@ -50,9 +56,23 @@ jobs:
           SERVER_PATH: /srv/stack
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DEPLOY_REVISION: ${{ github.sha }}
         run: |
-          set -e
+          set -euo pipefail
           cd "$SERVER_PATH"
-          docker compose pull backend
-          docker compose up -d
+
+          echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+          deploy_image="$DOCKERHUB_USERNAME/$IMAGE_NAME:$DEPLOY_REVISION"
+          latest_image="$DOCKERHUB_USERNAME/$IMAGE_NAME:latest"
+
+          docker pull "$deploy_image"
+          docker tag "$deploy_image" "$latest_image"
+          docker compose up -d --force-recreate --no-deps backend
+
+          container_id="$(docker compose ps -q backend)"
+          running_revision="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$container_id")"
+          test "$running_revision" = "$DEPLOY_REVISION"
+          echo "Deployed backend revision: $running_revision"
+
           docker system prune -f

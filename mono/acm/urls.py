@@ -14,6 +14,8 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+import os
+
 from django.contrib import admin
 from django.http import HttpResponse
 from django.urls import path, include
@@ -23,8 +25,12 @@ from accounts.views_oauth import GithubLoginView, GithubCallbackView
 from acm.views_uploads import UploadView
 
 
-# Simple healthcheck api
-def healthz(_): return HttpResponse("ok")
+# Simple healthcheck API. The revision makes stale deployments immediately visible.
+def healthz(_):
+    revision = os.environ.get("APP_REVISION", "unknown")
+    response = HttpResponse(f"ok {revision}\n", content_type="text/plain")
+    response["X-App-Revision"] = revision
+    return response
 
 urlpatterns = [
     # admin shit

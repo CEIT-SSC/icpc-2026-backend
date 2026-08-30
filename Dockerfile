@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ARG APP_REVISION=unknown
+ENV APP_REVISION=$APP_REVISION
+LABEL org.opencontainers.image.revision=$APP_REVISION
+
 RUN useradd -ms /bin/bash app && chown -R app:app /app
 USER app
 
