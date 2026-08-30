@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from .models import Course, Presenter, ScheduleRule, Registration, RegistrationItem, CourseSession
 
@@ -21,16 +22,39 @@ class ScheduleRuleSerializer(serializers.ModelSerializer):
 
 class ChildCourseSerializer(serializers.ModelSerializer):
     schedule = ScheduleRuleSerializer(many=True, read_only=True)
+    offering_type_display = serializers.CharField(
+        source="get_offering_type_display", read_only=True
+    )
+    currency = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
-        fields = ("id", "name", "capacity", "price", "slug", "is_active", "schedule")
+        fields = (
+            "id",
+            "name",
+            "offering_type",
+            "offering_type_display",
+            "capacity",
+            "remained_capacity",
+            "is_unlimited",
+            "price",
+            "currency",
+            "slug",
+            "is_active",
+            "schedule",
+        )
+
+    def get_currency(self, obj: Course) -> str:
+        return settings.PAYMENT_CURRENCY
 
 
 class CourseSerializer(serializers.ModelSerializer):
     presenters = PresenterSerializer(many=True, read_only=True)
     schedule = ScheduleRuleSerializer(many=True, read_only=True)
-    children = ChildCourseSerializer(many=True, read_only=True)
+    offering_type_display = serializers.CharField(
+        source="get_offering_type_display", read_only=True
+    )
+    currency = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
@@ -44,15 +68,21 @@ class CourseSerializer(serializers.ModelSerializer):
             "online",
             "onsite",
             "classes_count",
+            "offering_type",
+            "offering_type_display",
             "capacity",
             "remained_capacity",
+            "is_unlimited",
             "price",
+            "currency",
             "requires_approval",
             "slug",
             "is_active",
             "schedule",
-            "children",
         )
+
+    def get_currency(self, obj: Course) -> str:
+        return settings.PAYMENT_CURRENCY
 
 
 class RegistrationItemSerializer(serializers.ModelSerializer):
@@ -65,12 +95,21 @@ class RegistrationItemSerializer(serializers.ModelSerializer):
 
 class RegistrationCreateSerializer(serializers.Serializer):
     course_id = serializers.IntegerField()
-    child_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False, default=list
-    )
     extra_answers = serializers.DictField(
         child=serializers.JSONField(), required=False
     )
+
+    def to_internal_value(self, data):
+        if "child_ids" in data:
+            raise serializers.ValidationError(
+                {
+                    "child_ids": (
+                        "Packages are not available; register for one offering "
+                        "using course_id only."
+                    )
+                }
+            )
+        return super().to_internal_value(data)
 
 
 class RegistrationSerializer(serializers.ModelSerializer):
@@ -84,6 +123,8 @@ class RegistrationSerializer(serializers.ModelSerializer):
             "id",
             "course",
             "user",
+            "price",
+            "currency",
             "status",
             "resume_url",
             "payment_link",
@@ -95,6 +136,8 @@ class RegistrationSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             "user",
+            "price",
+            "currency",
             "status",
             "payment_link",
             "rejection_reason",
@@ -105,9 +148,14 @@ class RegistrationSerializer(serializers.ModelSerializer):
         )
 
     def get_total_amount(self, obj: Registration) -> int:
-        base = obj.course.price or 0
+        base = obj.price if obj.price is not None else (obj.course.price or 0)
         extra = sum((i.price or 0) for i in obj.items.all())
         return base + extra
+
+    currency = serializers.SerializerMethodField()
+
+    def get_currency(self, obj: Registration) -> str:
+        return settings.PAYMENT_CURRENCY
 
 
 class SkyroomLinkGeneratorSerializer(serializers.Serializer):

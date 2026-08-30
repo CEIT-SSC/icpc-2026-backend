@@ -60,6 +60,7 @@ INSTALLED_APPS = [
 
 ZARINPAL_MERCHANT_ID = env("ZARINPAL_MERCHANT_ID",
                            default="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+PAYMENT_CURRENCY = env("PAYMENT_CURRENCY", default="IRT")
 PAYMENT_CALLBACK_BASE = env(
     "PAYMENT_CALLBACK_BASE", default="https://your-site.com/api/payment/callback/")
 PAYMENT_FRONTEND_RETURN = env(

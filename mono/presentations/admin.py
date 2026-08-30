@@ -16,10 +16,25 @@ class ScheduleInline(admin.TabularInline):
 
 @admin.register(Course)
 class CourseAdmin(admin.ModelAdmin):
-    list_display = ("name", "subtitle", "capacity", "price", "is_active")
+    list_display = (
+        "name",
+        "offering_type",
+        "capacity",
+        "remaining_capacity",
+        "price",
+        "is_active",
+    )
+    list_filter = ("offering_type", "is_active", "requires_approval")
     search_fields = ("name", "subtitle")
     inlines = [ScheduleInline]
     filter_horizontal = ("presenters",)
+    exclude = ("children",)
+    readonly_fields = ("online", "onsite")
+
+    @admin.display(description="Remaining capacity")
+    def remaining_capacity(self, obj: Course):
+        remaining = obj.remained_capacity()
+        return "Unlimited" if remaining is None else remaining
 
 
 @admin.register(CourseSession)
@@ -50,6 +65,7 @@ class RegistrationAdmin(admin.ModelAdmin):
         "user_email",
         "user_full_name",
         "user_phone",
+        "price",
         "status",
         "submitted_at",
         "decided_at",
@@ -76,6 +92,7 @@ class RegistrationAdmin(admin.ModelAdmin):
         "user_first_name",
         "user_last_name",
         "user_phone",
+        "price",
         "submitted_at",
         "decided_at",
         "payment_link",
@@ -87,6 +104,7 @@ class RegistrationAdmin(admin.ModelAdmin):
             "fields": (
                 "course",
                 "user",
+                "price",
                 "status",
                 "payment_link",
                 "rejection_reason",
@@ -154,9 +172,8 @@ class RegistrationAdmin(admin.ModelAdmin):
     reject_selected.short_description = "Reject (requires rejection_reason)"
 
     def finalize_selected(self, request, queryset):
-        count = 0
-        for reg in queryset.select_related("course", "user"):
-            set_status_final(reg, actor=request.user)
-            count += 1
+        regs = list(queryset.select_related("course", "user"))
+        set_status_final(regs, actor=request.user)
+        count = len(regs)
         self.message_user(request, f"Marked {count} registration(s) as paid")
     finalize_selected.short_description = "Mark paid (FINAL)"
