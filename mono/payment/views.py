@@ -2,6 +2,7 @@
 
 from django.conf import settings
 from django.http import HttpResponseRedirect
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -11,7 +12,15 @@ from .serializers import (
     VerifySerializer,
     PaymentSerializer, StartPaymentSerializer,
 )
-from .services import verify_by_authority, startpay
+from .services import process_gateway_callback, verify_by_authority, startpay
+
+
+def _frontend_return_url(**params):
+    """Add callback results without breaking an existing query string."""
+    parts = urlsplit(settings.PAYMENT_FRONTEND_RETURN)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({key: str(value) for key, value in params.items() if value is not None})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 class VerifyPaymentView(APIView):
@@ -38,12 +47,21 @@ class CallbackView(APIView):
     @extend_schema(
         request=None,
         responses={302: OpenApiResponse(description="Redirects to frontend with ?authority=...")},
-        description="Gateway callback. Redirects the user to the frontend, which then calls /api/payment/verify/."
+        description="Gateway callback. Verifies the payment server-side, then redirects to the frontend."
     )
     def get(self, request):
         authority = request.GET.get("Authority")
-        url = f"{settings.PAYMENT_FRONTEND_RETURN}?authority={authority}" if authority else settings.PAYMENT_FRONTEND_RETURN
-        return HttpResponseRedirect(url)
+        gateway_status = request.GET.get("Status", "")
+        if not authority:
+            return HttpResponseRedirect(_frontend_return_url(status="invalid_callback"))
+
+        payment = process_gateway_callback(
+            authority=authority,
+            gateway_status=gateway_status,
+        )
+        return HttpResponseRedirect(
+            _frontend_return_url(authority=authority, status=payment.status.lower())
+        )
 
 
 class StartpaymentView(APIView):

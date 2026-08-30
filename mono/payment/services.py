@@ -226,6 +226,37 @@ def verify_by_authority(*, user: User, authority: str) -> Payment:
             status_code=404,
         )
 
+    return _verify_pending_payment(p)
+
+
+@transaction.atomic
+def process_gateway_callback(*, authority: str, gateway_status: str) -> Payment:
+    """Process Zarinpal's server callback without relying on frontend authentication."""
+    try:
+        p = Payment.objects.select_for_update().get(authority=authority)
+    except Payment.DoesNotExist:
+        raise CustomAPIException(
+            code=EC.PAY_NOT_FOUND_FOR_USER,
+            message="Payment not found for this authority",
+            status_code=404,
+        )
+
+    if p.status != Payment.Status.PENDING:
+        return p
+
+    # Zarinpal sends Status=NOK when the customer cancels or the payment fails.
+    if gateway_status.upper() != "OK":
+        p.status = Payment.Status.FAILED
+        p.zarinpal_message = f"Gateway callback status: {gateway_status or 'missing'}"
+        p.save(update_fields=["status", "zarinpal_message", "updated_at"])
+        on_payment_failure(p)
+        return p
+
+    return _verify_pending_payment(p)
+
+
+def _verify_pending_payment(p: Payment) -> Payment:
+    """Verify and finalize a locked pending payment."""
     if p.status != Payment.Status.PENDING:
         # Already processed; return as-is
         return p
@@ -233,12 +264,12 @@ def verify_by_authority(*, user: User, authority: str) -> Payment:
     merchant = settings.ZARINPAL_MERCHANT_ID
 
     try:
-        res = _verify_payment(merchant_id=merchant, amount=p.amount, authority=authority)
+        res = _verify_payment(merchant_id=merchant, amount=p.amount, authority=p.authority)
     except requests.RequestException as e:
-        p.status = Payment.Status.FAILED
+        # A transient gateway/network error is not proof that the payment failed.
+        # Leave it pending so the callback or authenticated verify endpoint can retry.
         p.zarinpal_message = str(e)
-        p.save(update_fields=["status", "zarinpal_message"])
-        on_payment_failure(p)
+        p.save(update_fields=["zarinpal_message", "updated_at"])
         return p
 
     d = res.get("data", {}) or {}
@@ -246,7 +277,7 @@ def verify_by_authority(*, user: User, authority: str) -> Payment:
     p.zarinpal_code = str(code)
     p.zarinpal_message = d.get("message", "") or ""
 
-    if code == 100:
+    if code in (100, 101):
         p.status = Payment.Status.SUCCESSFUL
         p.ref_id = str(d.get("ref_id", "") or "")
         p.card_pan = str(d.get("card_pan", "") or "")
@@ -269,7 +300,7 @@ def verify_by_authority(*, user: User, authority: str) -> Payment:
                 Registration.objects
                 .select_for_update()
                 .select_related("course", "user")
-                .get(id=int(reg_id), user=user)
+                .get(id=int(reg_id), user=p.user)
             )
             set_status_final([reg])
     except Exception:
@@ -299,4 +330,3 @@ def startpay(authority: str) -> str:
             status_code=409
         )
     return new_payment.url
-

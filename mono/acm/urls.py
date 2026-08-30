@@ -31,10 +31,8 @@ urlpatterns = [
     path('api/admin/', admin.site.urls),
 
     # app shits
-    path("api/payment/", include("payment.urls")),
     path("api/notification/", include("notification.urls")),
     path("api/accounts/", include("accounts.urls")),
-    path("api/notification/", include("notification.urls")),
     path("api/presentations/", include("presentations.urls")),
     path("api/competitions/", include("competitions.urls")),
     path("api/payment/", include("payment.urls")),
