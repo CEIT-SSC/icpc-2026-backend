@@ -1,6 +1,15 @@
 # payment/domain_hooks.py
 from .models import Payment
 
+
+def _registration_id(payment: Payment) -> int | None:
+    value = (payment.metadata or {}).get("reg_id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def on_payment_success(payment: Payment):
     if payment.target_type == Payment.TargetType.COMPETITION:
         # TODO: Fix this
@@ -11,14 +20,25 @@ def on_payment_success(payment: Payment):
     elif payment.target_type == Payment.TargetType.COURSE:
         from presentations.models import Registration
         from presentations.services import set_status_final
-        ids = [int(s) for s in payment.target_id.split(",") if s.strip()]
-        regs_qs = Registration.objects.filter(id__in=ids)
-        set_status_final(list(regs_qs))
+
+        reg_id = _registration_id(payment)
+        if reg_id is None:
+            return
+        reg = Registration.objects.select_for_update().get(
+            id=reg_id,
+            user=payment.user,
+        )
+        set_status_final([reg])
 
 def on_payment_failure(payment: Payment):
-    # TODO: Fix this
     if payment.target_type == Payment.TargetType.COMPETITION:
         from competitions.models import TeamRequest
         from competitions.services import mark_payment_rejected
         tr = TeamRequest.objects.get(id=payment.target_id)
         mark_payment_rejected(tr)
+    elif payment.target_type == Payment.TargetType.COURSE:
+        from presentations.services import cancel_registration_for_failed_payment
+
+        reg_id = _registration_id(payment)
+        if reg_id is not None:
+            cancel_registration_for_failed_payment(reg_id, user=payment.user)

@@ -9,7 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Course, Registration
+from .models import Course, CourseSession, Registration
 from .serializers import (
     CourseSerializer,
     RegistrationCreateSerializer,
@@ -21,8 +21,30 @@ from .services import submit_registration, create_skyroom_link, get_course_sessi
 User = get_user_model()
 
 
+def purchasable_offerings():
+    return Course.objects.filter(
+        is_active=True,
+        offering_type__in=Course.OfferingType.values,
+    ).prefetch_related("presenters", "schedule")
+
+
+class CourseListView(generics.ListAPIView):
+    serializer_class = CourseSerializer
+    permission_classes = []
+
+    def get_queryset(self):
+        return purchasable_offerings().order_by("start_date", "id")
+
+    @extend_schema(
+        responses={200: CourseSerializer(many=True)},
+        description="List the individually purchasable presentations and workshops.",
+    )
+    def get(self, *args, **kwargs):
+        return super().get(*args, **kwargs)
+
+
 class CourseDetailView(generics.RetrieveAPIView):
-    queryset = Course.objects.filter(is_active=True).prefetch_related("presenters", "schedule")
+    queryset = purchasable_offerings()
     serializer_class = CourseSerializer
     lookup_field = "slug"
     permission_classes = []
@@ -40,7 +62,13 @@ class MyRegistrationsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return Registration.objects.filter(user=self.request.user).select_related("course")
+        if getattr(self, "swagger_fake_view", False):
+            return Registration.objects.none()
+        return (
+            Registration.objects.filter(user=self.request.user)
+            .select_related("course")
+            .prefetch_related("items__child_course")
+        )
 
     @extend_schema(
         responses={200: RegistrationSerializer(many=True)},
@@ -67,11 +95,15 @@ class RegistrationCreateView(APIView):
             s = RegistrationCreateSerializer(data=request.data)
             s.is_valid(raise_exception=True)
             data = s.validated_data
-            course = get_object_or_404(Course, id=data["course_id"], is_active=True)
+            course = get_object_or_404(
+                Course,
+                id=data["course_id"],
+                is_active=True,
+                offering_type__in=Course.OfferingType.values,
+            )
             reg = submit_registration(
                 course=course,
                 user=request.user,
-                child_ids=data.get("child_ids"),
                 extra_updates=data.get("extra_answers"),
             )
             return Response(RegistrationSerializer(reg).data, status=status.HTTP_200_OK)
@@ -117,6 +149,8 @@ class SkyroomLinkView(APIView):
 
 class CourseSessionsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
+    queryset = CourseSession.objects.none()
+    serializer_class = CourseSessionSerializer
 
     @extend_schema(
         responses={200: CourseSessionResponseSerializer(many=True)},

@@ -1,0 +1,29 @@
+# Source-control and workstation metadata
+.git/
+.github/
+.idea/
+.agents/
+.codex/
+
+# Secrets and local environments
+**/.env
+**/.env.*
+!**/.env.example
+**/.venv/
+**/venv/
+
+# Generated Python/test artifacts
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+
+# Development-only data and tooling
+mono/db.sqlite3
+mono/media/
+mono/static/
+mono/acm/test_settings.py
+**/tests.py
+**/tests/
+docs/

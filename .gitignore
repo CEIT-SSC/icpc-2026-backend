@@ -1,2 +1,25 @@
+# Local secrets
+.env
+.env.*
+!.env.example
 /mono/.env
-static
+!/mono/.env.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local runtime data
+/mono/db.sqlite3
+/mono/media/
+/mono/static/
+
+# Editor and agent-local metadata
+/.idea/
+/.agents/
+/.codex/

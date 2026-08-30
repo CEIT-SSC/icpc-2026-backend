@@ -56,12 +56,19 @@ def _unverified_list() -> List[Dict]:
 
 
 def _request_payment(
-    *, merchant_id: str, amount: int, description: str, email: str, mobile: Optional[str] = None
+    *,
+    merchant_id: str,
+    amount: int,
+    currency: str,
+    description: str,
+    email: str,
+    mobile: Optional[str] = None,
 ) -> dict:
     url = f"{Z_BASE}/request.json"
     payload = {
         "merchant_id": merchant_id,
         "amount": amount,
+        "currency": currency,
         "callback_url": _callback_url(),
         "description": description or "ACM purchase",
         "metadata": {"email": email, **({"mobile": mobile} if mobile else {})},
@@ -73,7 +80,11 @@ def _request_payment(
 
 def _verify_payment(*, merchant_id: str, amount: int, authority: str) -> dict:
     url = f"{Z_BASE}/verify.json"
-    payload = {"merchant_id": merchant_id, "amount": amount, "authority": authority}
+    payload = {
+        "merchant_id": merchant_id,
+        "amount": amount,
+        "authority": authority,
+    }
     r = requests.post(url, json=payload, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r.json()
@@ -85,10 +96,11 @@ def initiate_payment_for_target(
     *,
     user: User,
     target_type: str,
-    target_id: str,                      # e.g. "PARENT_ID,CHILD_ID_1,CHILD_ID_2"
+    target_id: str,
     amount: int,
+    currency: str | None = None,
     description: str = "",
-    extra_metadata: Optional[Dict[str, Any]] = None,   # attach {"reg_id": ..., "parent_course_id": ..., "child_course_ids":[...], ...}
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> StartPayResult:
     """
     1) Check existing PENDING payments for the user; if any authority is still unverified at the gateway,
@@ -96,7 +108,7 @@ def initiate_payment_for_target(
     2) Create a new Zarinpal request and persist a PENDING Payment with the returned authority.
     3) Return StartPay URL.
 
-    NOTE: target_id is a string so we can store composite IDs (e.g., "42,101,102").
+    ``target_id`` is stored as a string so each domain can use its native ID.
     """
     if not user or not user.is_authenticated:
         raise CustomAPIException(
@@ -106,6 +118,7 @@ def initiate_payment_for_target(
         )
 
     merchant = settings.ZARINPAL_MERCHANT_ID
+    currency = currency or settings.PAYMENT_CURRENCY
     if not merchant:
         raise CustomAPIException(
             code=EC.PAY_MERCHANT_NOT_CONFIGURED,
@@ -119,19 +132,28 @@ def initiate_payment_for_target(
         authorities_map = {item.get("authority"): item for item in _unverified_list()}
         for p in pending:
             if p.authority and p.authority in authorities_map:
-                v = _verify_payment(merchant_id=merchant, amount=p.amount, authority=p.authority)
+                v = _verify_payment(
+                    merchant_id=merchant,
+                    amount=p.amount,
+                    authority=p.authority,
+                )
                 d = v.get("data", {}) or {}
                 code = d.get("code")
+                same_target = (
+                    p.target_type == target_type
+                    and str(p.target_id) == str(target_id)
+                )
                 p.zarinpal_code = str(code)
                 p.zarinpal_message = d.get("message", "") or ""
-                if code == 100:
+                if code in (100, 101):
                     p.status = Payment.Status.SUCCESSFUL
                     p.ref_id = str(d.get("ref_id", "") or "")
                     p.card_pan = str(d.get("card_pan", "") or "")
                     p.card_hash = str(d.get("card_hash", "") or "")
                     p.save()
+                    on_payment_success(p)
                     # conflict if same purchase already paid
-                    if p.target_type == target_type and str(p.target_id) == str(target_id):
+                    if same_target:
                         raise CustomAPIException(
                             code=EC.PAY_EXISTING_SUCCESS,
                             message="Existing successful payment found for this purchase",
@@ -140,12 +162,16 @@ def initiate_payment_for_target(
                 else:
                     p.status = Payment.Status.FAILED
                     p.save()
+                    # A replacement for the same target keeps its existing seat hold.
+                    if not same_target:
+                        on_payment_failure(p)
 
     # Step 2: request payment
     try:
         res = _request_payment(
             merchant_id=merchant,
             amount=amount,
+            currency=currency,
             description=description or f"{target_type}:{target_id}",
             email=user.email,
             mobile=getattr(user, "phone_number", None),
@@ -156,6 +182,7 @@ def initiate_payment_for_target(
             target_type=target_type,
             target_id=str(target_id),
             amount=amount,
+            currency=currency,
             status=Payment.Status.PG_INITIATE_ERROR,
             zarinpal_message=str(e),
             description=description or "",
@@ -175,6 +202,7 @@ def initiate_payment_for_target(
             target_type=target_type,
             target_id=str(target_id),
             amount=amount,
+            currency=currency,
             status=Payment.Status.PG_INITIATE_ERROR,
             zarinpal_code=str(code),
             zarinpal_message=d.get("message", "") or "",
@@ -193,6 +221,7 @@ def initiate_payment_for_target(
         target_type=target_type,
         target_id=str(target_id),   # store as string
         amount=amount,
+        currency=currency,
         status=Payment.Status.PENDING,
         authority=authority,
         description=description or "",
@@ -264,7 +293,11 @@ def _verify_pending_payment(p: Payment) -> Payment:
     merchant = settings.ZARINPAL_MERCHANT_ID
 
     try:
-        res = _verify_payment(merchant_id=merchant, amount=p.amount, authority=p.authority)
+        res = _verify_payment(
+            merchant_id=merchant,
+            amount=p.amount,
+            authority=p.authority,
+        )
     except requests.RequestException as e:
         # A transient gateway/network error is not proof that the payment failed.
         # Leave it pending so the callback or authenticated verify endpoint can retry.
@@ -290,22 +323,6 @@ def _verify_pending_payment(p: Payment) -> Payment:
         on_payment_failure(p)
         return p
 
-    # If we know the registration that initiated this payment, finalize it now.
-    try:
-        reg_id = (p.metadata or {}).get("reg_id")
-        if reg_id:
-            from presentations.services import set_status_final  # local import to avoid circulars
-            from presentations.models import Registration
-            reg = (
-                Registration.objects
-                .select_for_update()
-                .select_related("course", "user")
-                .get(id=int(reg_id), user=p.user)
-            )
-            set_status_final([reg])
-    except Exception:
-        pass
-
     return p
 
 def startpay(authority: str) -> str:
@@ -316,12 +333,26 @@ def startpay(authority: str) -> str:
             message="Payment not found for this user/authority",
             status_code=404)
     try:
+        if current_payment.target_type == Payment.TargetType.COURSE:
+            from presentations.models import Registration
+            from presentations.services import set_status_approved
+
+            reg_id = (current_payment.metadata or {}).get("reg_id")
+            reg = Registration.objects.get(
+                id=int(reg_id),
+                user=current_payment.user,
+            )
+            if reg.status != Registration.Status.APPROVED:
+                return set_status_approved(reg).payment_link
+
         new_payment = initiate_payment_for_target(
             user=current_payment.user,
             target_type=current_payment.target_type,
             target_id=current_payment.target_id,
             amount=current_payment.amount,
+            currency=current_payment.currency,
             description=current_payment.description,
+            extra_metadata=current_payment.metadata,
         )
     except Exception as e:
         raise CustomAPIException(

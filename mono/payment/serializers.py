@@ -7,7 +7,7 @@ class VerifySerializer(serializers.Serializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = ("id","status","authority","ref_id","amount","zarinpal_code","zarinpal_message","target_type","target_id")
+        fields = ("id","status","authority","ref_id","amount","currency","zarinpal_code","zarinpal_message","target_type","target_id")
 
 
 class StartPaymentSerializer(serializers.Serializer):

@@ -17,7 +17,8 @@ class Payment(models.Model):
     target_type = models.CharField(max_length=16, choices=TargetType.choices)
     target_id = models.CharField(max_length=256, blank=True, default="")
 
-    amount = models.PositiveIntegerField()  # in Tomans/Rials as per your use
+    amount = models.PositiveIntegerField(help_text="Amount in the selected currency.")
+    currency = models.CharField(max_length=3, default="IRT")
 
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
 

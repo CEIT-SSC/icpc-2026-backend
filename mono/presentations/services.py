@@ -1,3 +1,4 @@
+from collections import Counter
 from datetime import datetime, timedelta
 
 import requests
@@ -11,7 +12,14 @@ from acm import error_codes as EC
 
 from payment.models import Payment
 from payment.services import initiate_payment_for_target
-from .models import Course, Registration, RegistrationItem, _is_full_by_count, CourseSession
+from .models import (
+    Course,
+    CourseSession,
+    Registration,
+    RegistrationItem,
+    _is_full_by_count,
+    _taken_seats,
+)
 from notification.services import send_status_change_email
 from accounts.models import UserExtraData
 from django.conf import settings
@@ -24,24 +32,12 @@ SKYROOM_ROOMID = settings.SKYROOM_ROOMID
 HEADERS = {"accept": "application/json", "content-type": "application/json"}
 
 
-def _is_full(capacity: int | None, taken: int) -> bool:
-    if capacity is None:
-        return False
-    if capacity == 0:
-        return True
-    return taken >= capacity
-
-
 def _parent_capacity_full(course: Course) -> bool:
     return _is_full_by_count(course)
 
 
-def _child_capacity_full(child: Course) -> bool:
-    return _is_full_by_count(child)
-
-
 def _compute_total_amount(reg: Registration) -> int:
-    parent = reg.course.price or 0
+    parent = reg.price if reg.price is not None else (reg.course.price or 0)
     children = sum((i.price or 0) for i in reg.items.all())
     return parent + children
 
@@ -51,6 +47,63 @@ def _compose_description(reg: Registration) -> str:
     if child_slugs:
         return f"{reg.course.slug} + [{child_slugs}]"
     return reg.course.slug
+
+
+def _validate_individual_offering(course: Course, child_ids: list[int]) -> None:
+    if child_ids:
+        raise CustomAPIException(
+            code=EC.REG_PACKAGE_UNAVAILABLE,
+            message="Package purchases are not available in the current offering catalogue.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if (
+        not course.is_active
+        or course.offering_type not in Course.OfferingType.values
+    ):
+        raise CustomAPIException(
+            code=EC.REG_OFFERING_UNAVAILABLE,
+            message="This offering is not available for individual purchase.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+def _capacity_claims(registrations: list[Registration]) -> Counter:
+    claims = Counter(reg.course_id for reg in registrations)
+    claims.update(
+        RegistrationItem.objects.filter(
+            registration_id__in=[reg.id for reg in registrations]
+        ).values_list("child_course_id", flat=True)
+    )
+    return claims
+
+
+def _lock_and_validate_capacity(registrations: list[Registration]) -> None:
+    """Lock every claimed offering and validate the batch as one atomic claim."""
+    if not registrations:
+        return
+
+    claims = _capacity_claims(registrations)
+    courses = {
+        course.id: course
+        for course in Course.objects.select_for_update()
+        .filter(id__in=sorted(claims))
+        .order_by("id")
+    }
+    excluded_ids = [reg.id for reg in registrations]
+
+    for course_id, requested_seats in claims.items():
+        course = courses[course_id]
+        if course.capacity is None:
+            continue
+        occupied = _taken_seats(
+            course, exclude_registration_ids=excluded_ids
+        )
+        if occupied + requested_seats > course.capacity:
+            raise CustomAPIException(
+                code=EC.REG_CAPACITY_UNAVAILABLE,
+                message=f"No remaining capacity for {course.name}.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
 
 
 @transaction.atomic
@@ -63,9 +116,9 @@ def submit_registration(
     resume_url: str | None = None,
 ) -> Registration:
     """
-    Do NOT block when full.
-    If parent OR any child is full => set RESERVED and force approval.
-    Else QUEUED.
+    Do not create a payment when full; preserve the existing RESERVED waitlist.
+    If the individual offering has a seat, set QUEUED and follow its configured
+    approval/payment flow.
     If no approval required AND status is QUEUED => auto-approve/finalize (free) or create payment link.
 
     Additionally: prevent buying a course/child that the user already owns (FINAL),
@@ -79,15 +132,8 @@ def submit_registration(
         )
 
     child_ids = list(dict.fromkeys(child_ids or []))
-
-    valid_children_qs = course.children.filter(is_active=True, id__in=child_ids)
-    valid_children = list(valid_children_qs)
-    if len(valid_children) != len(child_ids):
-        raise CustomAPIException(
-            code=EC.REG_CHILD_INVALID_SELECTION,
-            message="One or more selected child presentations are invalid.",
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+    course = Course.objects.select_for_update().get(pk=course.pk)
+    _validate_individual_offering(course, child_ids)
 
     # ----------------------------
     # ALREADY-OWNED GUARD
@@ -112,32 +158,27 @@ def submit_registration(
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    already_owned_children = [c for c in valid_children if c.id in owned_ids]
-    if already_owned_children:
-        names = ", ".join(c.name for c in already_owned_children)
-        raise CustomAPIException(
-            code=EC.REG_CHILD_ALREADY_OWNED,
-            message=f"You already own these selected child presentations: {names}",
-            status_code=status.HTTP_409_CONFLICT,
-        )
-
     parent_full = _parent_capacity_full(course)
-    full_children = [c for c in valid_children if _child_capacity_full(c)]
-    any_child_full = bool(full_children)
-    forced_waitlist = parent_full or any_child_full
-
-    reg, created = Registration.objects.get_or_create(course=course, user=user)
-    if (not created) and reg.status in [Registration.Status.FINAL]:
+    reg = Registration.objects.select_for_update().filter(
+        course=course, user=user
+    ).first()
+    if reg and reg.status in (
+        Registration.Status.APPROVED,
+        Registration.Status.FINAL,
+    ):
         raise CustomAPIException(
             code=EC.REG_ALREADY_FINAL_OR_APPROVED,
             message="You already have an approved registration for this presentation.",
             status_code=status.HTTP_409_CONFLICT,
         )
+    if reg is None:
+        reg = Registration(course=course, user=user)
 
     reg.resume_url = resume_url or reg.resume_url
+    reg.price = course.price
     reg.submitted_at = timezone.now()
     reg.rejection_reason = ""
-    reg.status = Registration.Status.RESERVED if forced_waitlist else Registration.Status.QUEUED
+    reg.status = Registration.Status.RESERVED if parent_full else Registration.Status.QUEUED
     reg.save()
 
     if extra_updates:
@@ -153,12 +194,6 @@ def submit_registration(
         extra.save()
 
     RegistrationItem.objects.filter(registration=reg).delete()
-    for c in valid_children:
-        RegistrationItem.objects.create(
-            registration=reg,
-            child_course=c,
-            price=c.price,
-        )
 
     send_status_change_email(
         to=user.email,
@@ -166,16 +201,14 @@ def submit_registration(
         extra={
             "course": course.name,
             "status": reg.status,
-            "waitlisted_children": ", ".join(ch.name for ch in full_children) if full_children else "",
+            "waitlisted_children": "",
         },
     )
 
-    requires_approval = bool(getattr(course, "requires_approval", False)) or any(
-        getattr(c, "requires_approval", False) for c in valid_children
-    ) or forced_waitlist
+    requires_approval = course.requires_approval or parent_full
 
     if not requires_approval and reg.status == Registration.Status.QUEUED:
-        _auto_progress_to_payment(reg)
+        reg = _auto_progress_to_payment(reg)
 
     return reg
 
@@ -188,26 +221,41 @@ def set_status_approved(
     override_amount: int | None = None,
     description: str | None = None,
 ) -> Registration:
+    reg = (
+        Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .get(pk=reg.pk)
+    )
+    _validate_individual_offering(reg.course, [])
+    if reg.items.exists():
+        raise CustomAPIException(
+            code=EC.REG_PACKAGE_UNAVAILABLE,
+            message="Package purchases are not available in the current offering catalogue.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if reg.status in (Registration.Status.APPROVED, Registration.Status.FINAL):
+        raise CustomAPIException(
+            code=EC.REG_ALREADY_FINAL_OR_APPROVED,
+            message="This registration is already approved or finalized.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    _lock_and_validate_capacity([reg])
     reg.status = Registration.Status.APPROVED
+    reg.save(update_fields=["status"])
 
     if payment_link is None:
         amount = override_amount if override_amount is not None else _compute_total_amount(reg)
 
-        parent_id = reg.course.id
-        child_ids = list(reg.items.values_list("child_course_id", flat=True))
-        # target_id as a CSV bundle: "parent,child1,child2"
-        bundle_target_id = ",".join([str(parent_id), *map(str, child_ids)])
-
         meta = {
             "reg_id": reg.id,
-            "parent_course_id": parent_id,
-            "child_course_ids": child_ids,
+            "course_id": reg.course_id,
         }
 
         payment_result = initiate_payment_for_target(
             user=reg.user,
             target_type=Payment.TargetType.COURSE,
-            target_id=bundle_target_id,
+            target_id=str(reg.id),
             amount=amount,
             description=description or _compose_description(reg),
             extra_metadata=meta,
@@ -229,24 +277,64 @@ def set_status_approved(
 
 @transaction.atomic
 def set_status_final(regs: list[Registration], *, actor: User | None = None) -> list[Registration]:
-    if len(regs) == 0:
-        return regs
+    if isinstance(regs, Registration):
+        regs = [regs]
+    reg_ids = [reg.id for reg in regs]
+    if not reg_ids:
+        return []
+
+    locked_by_id = {
+        reg.id: reg
+        for reg in Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .filter(id__in=reg_ids)
+    }
+    regs = [locked_by_id[reg_id] for reg_id in reg_ids]
+    _lock_and_validate_capacity(regs)
 
     for reg in regs:
         reg.status = Registration.Status.FINAL
         reg.decided_at = timezone.now()
         reg.save(update_fields=["status", "decided_at"])
 
-    send_status_change_email(
-        to=regs[0].user.email,
-        status_code="COURSE_REQUEST_FINAL",
-        extra={"course": regs[0].course.name},
-    )
+    for reg in regs:
+        send_status_change_email(
+            to=reg.user.email,
+            status_code="COURSE_REQUEST_FINAL",
+            extra={"course": reg.course.name},
+        )
     return regs
 
 
 @transaction.atomic
+def cancel_registration_for_failed_payment(registration_id: int, *, user: User) -> None:
+    """Release an APPROVED seat when its gateway payment definitively fails."""
+    reg = Registration.objects.select_for_update().filter(
+        id=registration_id,
+        user=user,
+        status=Registration.Status.APPROVED,
+    ).first()
+    if reg is None:
+        return
+    reg.status = Registration.Status.CANCELLED
+    reg.payment_link = ""
+    reg.decided_at = timezone.now()
+    reg.save(update_fields=["status", "payment_link", "decided_at"])
+
+
+@transaction.atomic
 def set_status_rejected(reg: Registration, *, actor: User | None = None) -> Registration:
+    reg = (
+        Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .get(pk=reg.pk)
+    )
+    if reg.status in (Registration.Status.APPROVED, Registration.Status.FINAL):
+        raise CustomAPIException(
+            code=EC.REG_ALREADY_FINAL_OR_APPROVED,
+            message="Approved or finalized registrations cannot be rejected.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
     if not reg.rejection_reason:
         raise CustomAPIException(
             code=EC.REG_REJECTION_REASON_REQUIRED,
@@ -264,20 +352,15 @@ def set_status_rejected(reg: Registration, *, actor: User | None = None) -> Regi
     return reg
 
 
-def _auto_progress_to_payment(reg: Registration) -> None:
+def _auto_progress_to_payment(reg: Registration) -> Registration:
     total = _compute_total_amount(reg)
     if total <= 0:
-        reg.status = Registration.Status.FINAL
-        reg.decided_at = timezone.now()
-        reg.payment_link = ""
-        reg.save(update_fields=["status", "decided_at", "payment_link"])
-        send_status_change_email(
-            to=reg.user.email,
-            status_code="COURSE_REQUEST_FINAL",
-            extra={"course": reg.course.name},
-        )
-    else:
-        set_status_approved(reg, override_amount=total, description=_compose_description(reg))
+        return set_status_final([reg])[0]
+    return set_status_approved(
+        reg,
+        override_amount=total,
+        description=_compose_description(reg),
+    )
 
 def get_course_sessions(user: User, course: Course):
     if not _user_has_access_to_course(user, course):
