@@ -23,6 +23,13 @@ class Notification(models.Model):
     template = models.ForeignKey(EmailTemplate, null=True, blank=True, on_delete=models.SET_NULL)
     context = models.JSONField(default=dict, blank=True)
     subject_override = models.CharField(max_length=200, blank=True)
+    deduplication_key = models.CharField(
+        max_length=160,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="Optional idempotency key for a logical notification.",
+    )
     sent_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=16, default="queued")  # queued/sent/failed
     error = models.TextField(blank=True)

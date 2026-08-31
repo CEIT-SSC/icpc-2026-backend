@@ -17,10 +17,12 @@ from .models import (
     CourseSession,
     Registration,
     RegistrationItem,
-    _is_full_by_count,
     _taken_seats,
 )
-from notification.services import send_status_change_email
+from notification.services import (
+    send_email_with_custom_template,
+    send_status_change_email,
+)
 from accounts.models import UserExtraData
 from django.conf import settings
 
@@ -30,10 +32,6 @@ SKYROOM_BASEURL = settings.SKYROOM_BASEURL
 SKYROOM_APIKEY = settings.SKYROOM_APIKEY
 SKYROOM_ROOMID = settings.SKYROOM_ROOMID
 HEADERS = {"accept": "application/json", "content-type": "application/json"}
-
-
-def _parent_capacity_full(course: Course) -> bool:
-    return _is_full_by_count(course)
 
 
 def _compute_total_amount(reg: Registration) -> int:
@@ -77,26 +75,37 @@ def _capacity_claims(registrations: list[Registration]) -> Counter:
     return claims
 
 
-def _lock_and_validate_capacity(registrations: list[Registration]) -> None:
-    """Lock every claimed offering and validate the batch as one atomic claim."""
+def _lock_claimed_courses(registrations: list[Registration]) -> dict[int, Course]:
     if not registrations:
-        return
+        return {}
 
     claims = _capacity_claims(registrations)
-    courses = {
+    return {
         course.id: course
         for course in Course.objects.select_for_update()
         .filter(id__in=sorted(claims))
         .order_by("id")
     }
+
+
+def _validate_capacity(
+    registrations: list[Registration], locked_courses: dict[int, Course]
+) -> None:
+    """Validate a batch while all claimed course rows are already locked."""
+    if not registrations:
+        return
+
+    claims = _capacity_claims(registrations)
     excluded_ids = [reg.id for reg in registrations]
 
     for course_id, requested_seats in claims.items():
-        course = courses[course_id]
+        course = locked_courses[course_id]
         if course.capacity is None:
             continue
         occupied = _taken_seats(
-            course, exclude_registration_ids=excluded_ids
+            course,
+            exclude_registration_ids=excluded_ids,
+            for_update=True,
         )
         if occupied + requested_seats > course.capacity:
             raise CustomAPIException(
@@ -104,6 +113,146 @@ def _lock_and_validate_capacity(registrations: list[Registration]) -> None:
                 message=f"No remaining capacity for {course.name}.",
                 status_code=status.HTTP_409_CONFLICT,
             )
+
+
+def _available_slots_locked(course: Course) -> int | None:
+    """Return available seats while the caller holds the course row lock."""
+    if course.capacity is None:
+        return None
+    occupied = _taken_seats(course, for_update=True)
+    return max(course.capacity - occupied, 0)
+
+
+def _first_waitlisted_locked(
+    course: Course, *, exclude_registration_id: int | None = None
+) -> Registration | None:
+    queryset = (
+        Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .filter(course=course, status=Registration.Status.RESERVED)
+        .order_by("submitted_at", "id")
+    )
+    if exclude_registration_id is not None:
+        queryset = queryset.exclude(id=exclude_registration_id)
+    return queryset.first()
+
+
+def _schedule_status_email(
+    *,
+    to: str,
+    status_code: str,
+    extra: dict,
+    deduplication_key: str | None = None,
+) -> None:
+    def send_after_commit():
+        send_status_change_email(
+            to=to,
+            status_code=status_code,
+            extra=extra,
+            deduplication_key=deduplication_key,
+        )
+
+    transaction.on_commit(send_after_commit, robust=True)
+
+
+def _schedule_promotion_email(reg: Registration) -> None:
+    to = reg.user.email
+    course_name = reg.course.name
+    payment_link = reg.payment_link
+    deduplication_key = f"course-waitlist-promoted:{reg.id}"
+
+    def send_after_commit():
+        send_email_with_custom_template(
+            to=to,
+            template="course_waitlist_promoted",
+            status_code="COURSE_WAITLIST_PROMOTED",
+            extra={
+                "course": course_name,
+                "payment_link": payment_link,
+                "link": payment_link,
+            },
+            deduplication_key=deduplication_key,
+        )
+
+    transaction.on_commit(send_after_commit, robust=True)
+
+
+def _schedule_waitlist_promotion(course_id: int) -> None:
+    def promote_after_commit():
+        from .tasks import promote_waitlist_task
+
+        promote_waitlist_task.delay(course_id)
+
+    transaction.on_commit(promote_after_commit, robust=True)
+
+
+def _progress_locked_registration(
+    reg: Registration,
+    *,
+    payment_link: str | None = None,
+    override_amount: int | None = None,
+    description: str | None = None,
+    promoted: bool = False,
+) -> Registration:
+    """Claim the locked seat and issue payment without any approval step."""
+    _validate_individual_offering(reg.course, [])
+    if reg.items.exists():
+        raise CustomAPIException(
+            code=EC.REG_PACKAGE_UNAVAILABLE,
+            message="Package purchases are not available in the current offering catalogue.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    amount = override_amount if override_amount is not None else _compute_total_amount(reg)
+    now = timezone.now()
+    if amount <= 0 and payment_link is None:
+        reg.status = Registration.Status.FINAL
+        reg.payment_link = ""
+        reg.decided_at = now
+        reg.save(update_fields=["status", "payment_link", "decided_at"])
+    else:
+        # APPROVED is the seat-holding/payment-eligible state. Saving it before
+        # gateway initiation also lets the nested payment service see the claim;
+        # any gateway exception rolls this transaction back atomically.
+        reg.status = Registration.Status.APPROVED
+        reg.save(update_fields=["status"])
+        if payment_link is None:
+            payment_result = initiate_payment_for_target(
+                user=reg.user,
+                target_type=Payment.TargetType.COURSE,
+                target_id=str(reg.id),
+                amount=amount,
+                description=description or _compose_description(reg),
+                extra_metadata={
+                    "reg_id": reg.id,
+                    "course_id": reg.course_id,
+                },
+            )
+            reg.payment_link = payment_result.url
+        else:
+            reg.payment_link = payment_link
+        reg.decided_at = now
+        reg.save(update_fields=["status", "payment_link", "decided_at"])
+
+    if promoted:
+        _schedule_promotion_email(reg)
+    else:
+        email_status = (
+            "COURSE_REQUEST_FINAL"
+            if reg.status == Registration.Status.FINAL
+            else "COURSE_REQUEST_APPROVED"
+        )
+        email_extra = {"course": reg.course.name}
+        if reg.payment_link:
+            email_extra.update(
+                {"payment_link": reg.payment_link, "link": reg.payment_link}
+            )
+        _schedule_status_email(
+            to=reg.user.email,
+            status_code=email_status,
+            extra=email_extra,
+        )
+    return reg
 
 
 @transaction.atomic
@@ -115,15 +264,7 @@ def submit_registration(
     child_ids: list[int] | None = None,
     resume_url: str | None = None,
 ) -> Registration:
-    """
-    Do not create a payment when full; preserve the existing RESERVED waitlist.
-    If the individual offering has a seat, set QUEUED and follow its configured
-    approval/payment flow.
-    If no approval required AND status is QUEUED => auto-approve/finalize (free) or create payment link.
-
-    Additionally: prevent buying a course/child that the user already owns (FINAL),
-    even if ownership came through a different parent registration.
-    """
+    """Allocate a seat immediately or create one deterministic FIFO waitlist row."""
     if (not user.is_authenticated) or (not getattr(user, "is_email_verified", False)):
         raise CustomAPIException(
             code=EC.ACC_EMAIL_NOT_VERIFIED,
@@ -158,7 +299,6 @@ def submit_registration(
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    parent_full = _parent_capacity_full(course)
     reg = Registration.objects.select_for_update().filter(
         course=course, user=user
     ).first()
@@ -171,46 +311,73 @@ def submit_registration(
             message="You already have an approved registration for this presentation.",
             status_code=status.HTTP_409_CONFLICT,
         )
+    if reg and reg.status == Registration.Status.RESERVED:
+        # Repeated/concurrent submissions are idempotent and do not move a user
+        # to the back of the queue or send duplicate submission notifications.
+        if resume_url and resume_url != reg.resume_url:
+            reg.resume_url = resume_url
+            reg.save(update_fields=["resume_url"])
+        if extra_updates:
+            _update_user_extra_data(user=user, extra_updates=extra_updates)
+        if _available_slots_locked(course) not in (0,):
+            _schedule_waitlist_promotion(course.id)
+        return reg
     if reg is None:
         reg = Registration(course=course, user=user)
+
+    waitlist_has_priority = _first_waitlisted_locked(
+        course, exclude_registration_id=reg.id
+    ) is not None
+    available_slots = _available_slots_locked(course)
+    capacity_available = available_slots is None or available_slots > 0
 
     reg.resume_url = resume_url or reg.resume_url
     reg.price = course.price
     reg.submitted_at = timezone.now()
     reg.rejection_reason = ""
-    reg.status = Registration.Status.RESERVED if parent_full else Registration.Status.QUEUED
+    reg.payment_link = ""
+    reg.decided_at = None
+    reg.status = (
+        Registration.Status.RESERVED
+        if waitlist_has_priority or not capacity_available
+        else Registration.Status.QUEUED
+    )
     reg.save()
 
     if extra_updates:
-        extra, _ = UserExtraData.objects.get_or_create(user=user)
-        extra.answers = {**(extra.answers or {}), **extra_updates}
-        if "codeforces_score" in extra_updates:
-            try:
-                extra.codeforces_score = int(extra_updates["codeforces_score"])
-            except Exception:
-                pass
-        if "codeforces_handle" in extra_updates:
-            extra.codeforces_handle = str(extra_updates["codeforces_handle"])[:64]
-        extra.save()
+        _update_user_extra_data(user=user, extra_updates=extra_updates)
 
     RegistrationItem.objects.filter(registration=reg).delete()
 
-    send_status_change_email(
+    _schedule_status_email(
         to=user.email,
         status_code="COURSE_REQUEST_SUBMITTED",
         extra={
             "course": course.name,
             "status": reg.status,
-            "waitlisted_children": "",
+            "waitlist_position": reg.waitlist_position(),
         },
     )
-
-    requires_approval = course.requires_approval or parent_full
-
-    if not requires_approval and reg.status == Registration.Status.QUEUED:
-        reg = _auto_progress_to_payment(reg)
-
+    if reg.status == Registration.Status.QUEUED:
+        reg = _progress_locked_registration(
+            reg,
+            override_amount=_compute_total_amount(reg),
+            description=_compose_description(reg),
+        )
     return reg
+
+
+def _update_user_extra_data(*, user: User, extra_updates: dict) -> None:
+    extra, _ = UserExtraData.objects.get_or_create(user=user)
+    extra.answers = {**(extra.answers or {}), **extra_updates}
+    if "codeforces_score" in extra_updates:
+        try:
+            extra.codeforces_score = int(extra_updates["codeforces_score"])
+        except (TypeError, ValueError):
+            pass
+    if "codeforces_handle" in extra_updates:
+        extra.codeforces_handle = str(extra_updates["codeforces_handle"])[:64]
+    extra.save()
 
 @transaction.atomic
 def set_status_approved(
@@ -221,58 +388,61 @@ def set_status_approved(
     override_amount: int | None = None,
     description: str | None = None,
 ) -> Registration:
+    course = Course.objects.select_for_update().get(pk=reg.course_id)
     reg = (
         Registration.objects.select_for_update()
         .select_related("course", "user")
         .get(pk=reg.pk)
     )
-    _validate_individual_offering(reg.course, [])
-    if reg.items.exists():
-        raise CustomAPIException(
-            code=EC.REG_PACKAGE_UNAVAILABLE,
-            message="Package purchases are not available in the current offering catalogue.",
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
     if reg.status in (Registration.Status.APPROVED, Registration.Status.FINAL):
+        return reg
+
+    first_waitlisted = _first_waitlisted_locked(course)
+    if first_waitlisted is not None and first_waitlisted.id != reg.id:
         raise CustomAPIException(
-            code=EC.REG_ALREADY_FINAL_OR_APPROVED,
-            message="This registration is already approved or finalized.",
+            code=EC.REG_CAPACITY_UNAVAILABLE,
+            message="Earlier waitlisted registrations have priority for the next slot.",
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    _lock_and_validate_capacity([reg])
-    reg.status = Registration.Status.APPROVED
-    reg.save(update_fields=["status"])
-
-    if payment_link is None:
-        amount = override_amount if override_amount is not None else _compute_total_amount(reg)
-
-        meta = {
-            "reg_id": reg.id,
-            "course_id": reg.course_id,
-        }
-
-        payment_result = initiate_payment_for_target(
-            user=reg.user,
-            target_type=Payment.TargetType.COURSE,
-            target_id=str(reg.id),
-            amount=amount,
-            description=description or _compose_description(reg),
-            extra_metadata=meta,
-        )
-        reg.payment_link = payment_result.url
-    else:
-        reg.payment_link = payment_link
-
-    reg.decided_at = timezone.now()
-    reg.save(update_fields=["status", "payment_link", "decided_at"])
-
-    send_status_change_email(
-        to=reg.user.email,
-        status_code="COURSE_REQUEST_APPROVED",
-        extra={"course": reg.course.name, "payment_link": reg.payment_link},
+    _validate_capacity([reg], {course.id: course})
+    return _progress_locked_registration(
+        reg,
+        payment_link=payment_link,
+        override_amount=override_amount,
+        description=description,
     )
-    return reg
+
+
+@transaction.atomic
+def promote_waitlist(*, course_id: int) -> list[Registration]:
+    """Promote exactly the oldest waitlisted rows that fit available capacity."""
+    course = Course.objects.select_for_update().get(pk=course_id)
+    available_slots = _available_slots_locked(course)
+    if available_slots == 0:
+        return []
+
+    candidates = (
+        Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .filter(course=course, status=Registration.Status.RESERVED)
+        .order_by("submitted_at", "id")
+    )
+    if available_slots is not None:
+        candidates = candidates[:available_slots]
+
+    promoted = []
+    for reg in list(candidates):
+        _validate_capacity([reg], {course.id: course})
+        promoted.append(
+            _progress_locked_registration(
+                reg,
+                override_amount=_compute_total_amount(reg),
+                description=_compose_description(reg),
+                promoted=True,
+            )
+        )
+    return promoted
 
 
 @transaction.atomic
@@ -283,6 +453,7 @@ def set_status_final(regs: list[Registration], *, actor: User | None = None) -> 
     if not reg_ids:
         return []
 
+    locked_courses = _lock_claimed_courses(regs)
     locked_by_id = {
         reg.id: reg
         for reg in Registration.objects.select_for_update()
@@ -290,15 +461,28 @@ def set_status_final(regs: list[Registration], *, actor: User | None = None) -> 
         .filter(id__in=reg_ids)
     }
     regs = [locked_by_id[reg_id] for reg_id in reg_ids]
-    _lock_and_validate_capacity(regs)
+    pending_finalization = [
+        reg for reg in regs if reg.status != Registration.Status.FINAL
+    ]
+    invalid = [
+        reg
+        for reg in pending_finalization
+        if reg.status != Registration.Status.APPROVED
+    ]
+    if invalid:
+        raise CustomAPIException(
+            code=EC.REG_APPROVAL_REQUIRED,
+            message="Only payment-eligible registrations can be finalized.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+    _validate_capacity(pending_finalization, locked_courses)
 
-    for reg in regs:
+    for reg in pending_finalization:
         reg.status = Registration.Status.FINAL
         reg.decided_at = timezone.now()
         reg.save(update_fields=["status", "decided_at"])
 
-    for reg in regs:
-        send_status_change_email(
+        _schedule_status_email(
             to=reg.user.email,
             status_code="COURSE_REQUEST_FINAL",
             extra={"course": reg.course.name},
@@ -309,6 +493,12 @@ def set_status_final(regs: list[Registration], *, actor: User | None = None) -> 
 @transaction.atomic
 def cancel_registration_for_failed_payment(registration_id: int, *, user: User) -> None:
     """Release an APPROVED seat when its gateway payment definitively fails."""
+    course_id = Registration.objects.filter(
+        id=registration_id, user=user
+    ).values_list("course_id", flat=True).first()
+    if course_id is None:
+        return
+    Course.objects.select_for_update().get(pk=course_id)
     reg = Registration.objects.select_for_update().filter(
         id=registration_id,
         user=user,
@@ -320,10 +510,12 @@ def cancel_registration_for_failed_payment(registration_id: int, *, user: User) 
     reg.payment_link = ""
     reg.decided_at = timezone.now()
     reg.save(update_fields=["status", "payment_link", "decided_at"])
+    _schedule_waitlist_promotion(course_id)
 
 
 @transaction.atomic
 def set_status_rejected(reg: Registration, *, actor: User | None = None) -> Registration:
+    course = Course.objects.select_for_update().get(pk=reg.course_id)
     reg = (
         Registration.objects.select_for_update()
         .select_related("course", "user")
@@ -341,26 +533,18 @@ def set_status_rejected(reg: Registration, *, actor: User | None = None) -> Regi
             message="rejection_reason must be set before rejecting",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+    was_waitlisted = reg.status == Registration.Status.RESERVED
     reg.status = Registration.Status.REJECTED
     reg.decided_at = timezone.now()
     reg.save(update_fields=["status", "decided_at"])
-    send_status_change_email(
+    _schedule_status_email(
         to=reg.user.email,
         status_code="COURSE_REQUEST_REJECTED",
         extra={"course": reg.course.name, "reason": reg.rejection_reason},
     )
+    if was_waitlisted:
+        _schedule_waitlist_promotion(course.id)
     return reg
-
-
-def _auto_progress_to_payment(reg: Registration) -> Registration:
-    total = _compute_total_amount(reg)
-    if total <= 0:
-        return set_status_final([reg])[0]
-    return set_status_approved(
-        reg,
-        override_amount=total,
-        description=_compose_description(reg),
-    )
 
 def get_course_sessions(user: User, course: Course):
     if not _user_has_access_to_course(user, course):
