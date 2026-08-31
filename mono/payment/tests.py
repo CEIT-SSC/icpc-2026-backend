@@ -160,6 +160,37 @@ class CoursePaymentLifecycleTests(TestCase):
         self.assertEqual(self.registration.status, Registration.Status.CANCELLED)
         self.assertEqual(self.course.remained_capacity(), 1)
 
+    @patch("presentations.services.send_email_with_custom_template")
+    @patch("presentations.services.initiate_payment_for_target")
+    def test_failed_payment_promotes_the_next_waitlisted_registration(
+        self, initiate, promotion_email
+    ):
+        waiting_user = get_user_model().objects.create_user(
+            email="next-payer@example.com",
+            is_email_verified=True,
+        )
+        waiting = Registration.objects.create(
+            course=self.course,
+            user=waiting_user,
+            price=self.course.price,
+            status=Registration.Status.RESERVED,
+        )
+        initiate.return_value.url = "https://payment.example/promoted"
+
+        with self.captureOnCommitCallbacks(execute=True):
+            process_gateway_callback(
+                authority=self.payment.authority,
+                gateway_status="NOK",
+            )
+
+        self.registration.refresh_from_db()
+        waiting.refresh_from_db()
+        self.assertEqual(self.registration.status, Registration.Status.CANCELLED)
+        self.assertEqual(waiting.status, Registration.Status.APPROVED)
+        self.assertEqual(waiting.payment_link, "https://payment.example/promoted")
+        self.assertEqual(self.course.remained_capacity(), 0)
+        promotion_email.assert_called_once()
+
     @patch("presentations.services.send_status_change_email")
     @patch("presentations.services.initiate_payment_for_target")
     def test_retry_reclaims_capacity_before_issuing_link(self, initiate, _email):

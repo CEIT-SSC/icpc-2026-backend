@@ -55,6 +55,7 @@ class CourseSerializer(serializers.ModelSerializer):
         source="get_offering_type_display", read_only=True
     )
     currency = serializers.SerializerMethodField()
+    requires_approval = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
@@ -83,6 +84,10 @@ class CourseSerializer(serializers.ModelSerializer):
 
     def get_currency(self, obj: Course) -> str:
         return settings.PAYMENT_CURRENCY
+
+    def get_requires_approval(self, obj: Course) -> bool:
+        # Kept in the response for compatibility; manual approval is retired.
+        return False
 
 
 class RegistrationItemSerializer(serializers.ModelSerializer):
@@ -116,6 +121,7 @@ class RegistrationSerializer(serializers.ModelSerializer):
     course = CourseSerializer(read_only=True)
     items = RegistrationItemSerializer(many=True, read_only=True)
     total_amount = serializers.SerializerMethodField()
+    waitlist_position = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Registration
@@ -126,6 +132,7 @@ class RegistrationSerializer(serializers.ModelSerializer):
             "price",
             "currency",
             "status",
+            "waitlist_position",
             "resume_url",
             "payment_link",
             "rejection_reason",
@@ -139,6 +146,7 @@ class RegistrationSerializer(serializers.ModelSerializer):
             "price",
             "currency",
             "status",
+            "waitlist_position",
             "payment_link",
             "rejection_reason",
             "submitted_at",

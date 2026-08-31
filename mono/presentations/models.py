@@ -14,8 +14,10 @@ capacity: finalizing one purchase must atomically claim every finite child seat.
 """
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
-from django.db import models
+from django.db import models, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -112,8 +114,8 @@ class Course(models.Model):
     )
 
     requires_approval = models.BooleanField(
-        default=True,
-        help_text="If off, registrations auto-approve (or finalize if price=0).",
+        default=False,
+        help_text="Legacy setting; registrations now progress automatically when capacity is available.",
     )
 
     slug = models.SlugField(max_length=220, unique=True, blank=True)
@@ -139,7 +141,41 @@ class Course(models.Model):
         self.apply_offering_defaults()
         if not self.slug:
             self.slug = slugify(self.name)[:220]
-        return super().save(*args, **kwargs)
+
+        update_fields = kwargs.get("update_fields")
+        capacity_is_being_saved = update_fields is None or "capacity" in update_fields
+        if self._state.adding or not capacity_is_being_saved:
+            return super().save(*args, **kwargs)
+
+        # Every seat allocation also locks this row first. Locking capacity
+        # changes here makes increases/decreases serialize with registrations,
+        # payments, cancellations, and waitlist promotions.
+        with transaction.atomic():
+            current = Course.objects.select_for_update().get(pk=self.pk)
+            capacity_changed = current.capacity != self.capacity
+            if capacity_changed and self.capacity is not None:
+                occupied = _taken_seats(current, for_update=True)
+                if self.capacity < occupied:
+                    raise ValidationError(
+                        {
+                            "capacity": (
+                                f"Capacity cannot be lower than the {occupied} "
+                                "currently allocated seat(s)."
+                            )
+                        }
+                    )
+
+            result = super().save(*args, **kwargs)
+            if capacity_changed:
+                course_id = self.pk
+
+                def promote_after_capacity_change():
+                    from .tasks import promote_waitlist_task
+
+                    promote_waitlist_task.delay(course_id)
+
+                transaction.on_commit(promote_after_capacity_change, robust=True)
+            return result
 
     @property
     def is_unlimited(self) -> bool:
@@ -182,7 +218,7 @@ class ScheduleRule(models.Model):
 class Registration(models.Model):
     class Status(models.TextChoices):
         SUBMITTED = "SUBMITTED", "Submitted"
-        RESERVED = "RESERVED", "Reserved"   # capacity full -> RESERVED
+        RESERVED = "RESERVED", "Waitlisted"  # capacity full -> FIFO waitlist
         QUEUED = "QUEUED", "Queued"         # capacity available -> QUEUED
         APPROVED = "APPROVED", "Approved"
         FINAL = "FINAL", "Finalized"
@@ -214,9 +250,28 @@ class Registration(models.Model):
     class Meta:
         unique_together = ("course", "user")
         ordering = ["-submitted_at"]
+        indexes = [
+            models.Index(
+                fields=["course", "status", "submitted_at", "id"],
+                name="pres_reg_wait_fifo_idx",
+            )
+        ]
 
     def __str__(self):
         return f"Reg<{self.user_id}:{self.course.slug}:{self.status}>"
+
+    def waitlist_position(self) -> int | None:
+        """Return the current one-based FIFO position for a waitlisted user."""
+        if self.status != self.Status.RESERVED or not self.pk:
+            return None
+        earlier = Registration.objects.filter(
+            course_id=self.course_id,
+            status=self.Status.RESERVED,
+        ).filter(
+            Q(submitted_at__lt=self.submitted_at)
+            | Q(submitted_at=self.submitted_at, id__lt=self.id)
+        )
+        return earlier.count() + 1
 
 
 class RegistrationItem(models.Model):
@@ -253,7 +308,9 @@ class CourseSession(models.Model):
 
 COUNT_STATUSES = (Registration.Status.APPROVED, Registration.Status.FINAL)
 
-def _taken_seats(course, *, exclude_registration_ids=None) -> int:
+def _taken_seats(
+    course, *, exclude_registration_ids=None, for_update: bool = False
+) -> int:
     """How many seats of `course` are occupied in COUNT_STATUSES,
     counting both direct (parent) and child purchases."""
     direct_qs = Registration.objects.filter(
@@ -267,6 +324,16 @@ def _taken_seats(course, *, exclude_registration_ids=None) -> int:
     if exclude_registration_ids:
         direct_qs = direct_qs.exclude(id__in=exclude_registration_ids)
         child_qs = child_qs.exclude(registration_id__in=exclude_registration_ids)
+    if for_update:
+        # A locking read is a current read on MySQL. This avoids an older
+        # REPEATABLE READ snapshot after waiting for the course lock.
+        direct = len(
+            list(direct_qs.select_for_update().values_list("id", flat=True))
+        )
+        children = len(
+            list(child_qs.select_for_update().values_list("id", flat=True))
+        )
+        return direct + children
     return direct_qs.count() + child_qs.count()
 
 def _is_full_by_count(course) -> bool:

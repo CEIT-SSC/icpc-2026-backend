@@ -14,24 +14,33 @@ CHUNK = settings.NOTIF_BULK_CHUNK_SIZE
 
 @shared_task(bind=True, rate_limit=RATE, autoretry_for=(Exception,), retry_backoff=True, retry_backoff_max=600, retry_jitter=True, max_retries=MAX_RETRY)
 def send_notification_task(self, notification_id: int):
-    n = Notification.objects.select_related("template").get(id=notification_id)
-    if n.status == "sent":
-        return
-    provider = get_email_provider()
-    subject, html, text = render_email(n.template, n.context)
-    if n.subject_override:
-        subject = n.subject_override
     try:
-        provider.send(to=n.to, subject=subject, html=html, text=text)
-        n.status = "sent"
-        n.sent_at = timezone.now()
-        n.error = ""
+        # A duplicated Celery delivery must not concurrently send the same
+        # logical notification twice. The unique deduplication key prevents
+        # duplicate rows; this row lock serializes duplicate task deliveries.
+        with transaction.atomic():
+            n = (
+                Notification.objects.select_for_update()
+                .select_related("template")
+                .get(id=notification_id)
+            )
+            if n.status == "sent":
+                return
+            provider = get_email_provider()
+            subject, html, text = render_email(n.template, n.context)
+            if n.subject_override:
+                subject = n.subject_override
+            provider.send(to=n.to, subject=subject, html=html, text=text)
+            n.status = "sent"
+            n.sent_at = timezone.now()
+            n.error = ""
+            n.save(update_fields=["status", "sent_at", "error"])
     except Exception as e:
-        n.status = "failed"
-        n.error = str(e)
+        Notification.objects.exclude(status="sent").filter(id=notification_id).update(
+            status="failed",
+            error=str(e),
+        )
         raise  # let Celery retry
-    finally:
-        n.save(update_fields=["status", "sent_at", "error"])
 
 @shared_task(bind=True)
 def dispatch_bulk_job(self, job_id: int):

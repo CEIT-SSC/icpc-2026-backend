@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils import timezone
 
 from .models import Course, Presenter, ScheduleRule, Registration, CourseSession
-from .services import set_status_approved, set_status_rejected, set_status_final
+from .services import set_status_rejected, set_status_final
 
 
 
@@ -24,12 +24,12 @@ class CourseAdmin(admin.ModelAdmin):
         "price",
         "is_active",
     )
-    list_filter = ("offering_type", "is_active", "requires_approval")
+    list_filter = ("offering_type", "is_active")
     search_fields = ("name", "subtitle")
     inlines = [ScheduleInline]
     filter_horizontal = ("presenters",)
     exclude = ("children",)
-    readonly_fields = ("online", "onsite")
+    readonly_fields = ("online", "onsite", "requires_approval")
 
     @admin.display(description="Remaining capacity")
     def remaining_capacity(self, obj: Course):
@@ -93,6 +93,7 @@ class RegistrationAdmin(admin.ModelAdmin):
         "user_last_name",
         "user_phone",
         "price",
+        "status",
         "submitted_at",
         "decided_at",
         "payment_link",
@@ -124,7 +125,7 @@ class RegistrationAdmin(admin.ModelAdmin):
     )
 
     
-    actions = ("approve_selected", "reject_selected", "finalize_selected")
+    actions = ("reject_selected", "finalize_selected")
 
     
 
@@ -152,14 +153,6 @@ class RegistrationAdmin(admin.ModelAdmin):
 
     
 
-    def approve_selected(self, request, queryset):
-        count = 0
-        for reg in queryset.select_related("course", "user"):
-            set_status_approved(reg, actor=request.user)
-            count += 1
-        self.message_user(request, f"Approved {count} registration(s)")
-    approve_selected.short_description = "Approve (and issue payment link if applicable)"
-
     def reject_selected(self, request, queryset):
         count = 0
         for reg in queryset.select_related("course", "user"):
@@ -172,7 +165,11 @@ class RegistrationAdmin(admin.ModelAdmin):
     reject_selected.short_description = "Reject (requires rejection_reason)"
 
     def finalize_selected(self, request, queryset):
-        regs = list(queryset.select_related("course", "user"))
+        regs = list(
+            queryset.filter(status=Registration.Status.APPROVED).select_related(
+                "course", "user"
+            )
+        )
         set_status_final(regs, actor=request.user)
         count = len(regs)
         self.message_user(request, f"Marked {count} registration(s) as paid")

@@ -24,7 +24,9 @@ def on_payment_success(payment: Payment):
         reg_id = _registration_id(payment)
         if reg_id is None:
             return
-        reg = Registration.objects.select_for_update().get(
+        # The presentation service acquires locks in course-then-registration
+        # order, matching registration, capacity update, and promotion flows.
+        reg = Registration.objects.only("id", "course_id").get(
             id=reg_id,
             user=payment.user,
         )
