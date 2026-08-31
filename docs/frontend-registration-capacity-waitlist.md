@@ -4,6 +4,11 @@
 می‌کند. این موارد، بخش‌های مرتبط با approval و sold-out در
 `frontend-individual-offerings-prompt.md` را جایگزین می‌کنند.
 
+> جریان پرداخت این سند با جریان on-demand جایگزین شده است. برای قرارداد کامل
+> API و تغییرات لازم فرانت، سند
+> [`frontend-on-demand-payment-flow.md`](frontend-on-demand-payment-flow.md) را
+> مبنا قرار دهید.
+
 ## خلاصه تغییر رفتار
 
 - تأیید دستی ادمین حذف شده است. وقتی ظرفیت وجود دارد، کاربر بلافاصله امکان
@@ -11,8 +16,8 @@
 - پر بودن ظرفیت نباید دکمه ثبت‌نام را غیرفعال کند؛ کاربر باید بتواند وارد صف
   انتظار شود.
 - صف انتظار FIFO است و API موقعیت فعلی کاربر را در `waitlist_position` برمی‌گرداند.
-- بعد از آزاد شدن ظرفیت، بک‌اند کاربر را ارتقا می‌دهد، لینک پرداخت می‌سازد و
-  ایمیل اطلاع‌رسانی ارسال می‌کند.
+- بعد از آزاد شدن ظرفیت، بک‌اند کاربر را به `APPROVED` ارتقا می‌دهد و ایمیل
+  اطلاع‌رسانی ارسال می‌کند؛ لینک فقط با کلیک کاربر روی پرداخت ساخته می‌شود.
 
 ## تغییر Type و Schema
 
@@ -75,9 +80,9 @@ Content-Type: application/json
 | وضعیت | رفتار فرانت |
 | --- | --- |
 | `RESERVED` | پیام ورود موفق به صف و `waitlist_position` را نمایش بده؛ دکمه پرداخت نمایش داده نشود. |
-| `APPROVED` | کاربر واجد پرداخت است؛ اگر `payment_link` وجود دارد CTA پرداخت نمایش بده. |
+| `APPROVED` | کاربر واجد پرداخت است؛ CTA پرداخت را مستقل از خالی بودن `payment_link` نمایش بده. |
 | `FINAL` | ثبت‌نام نهایی/پرداخت‌شده نمایش داده شود؛ CTA پرداخت پنهان باشد. |
-| `CANCELLED` | شکست یا لغو پرداخت نمایش داده شود؛ برای تلاش دوباره از جریان موجود پروژه استفاده شود. |
+| `CANCELLED` | شکست یا لغو پرداخت نمایش داده شود؛ retry از endpoint جدید on-demand انجام شود. |
 | `QUEUED` یا `SUBMITTED` | فقط به عنوان وضعیت گذرای سازگاری در نظر گرفته و داده registration دوباره fetch شود؛ متن تأیید ادمین نمایش داده نشود. |
 | `REJECTED` | دلیل رد موجود، در صورت وجود، نمایش داده شود. |
 
@@ -99,7 +104,7 @@ Content-Type: application/json
   "id": 42,
   "status": "APPROVED",
   "waitlist_position": null,
-  "payment_link": "https://payment.example/start/..."
+  "payment_link": ""
 }
 ```
 
@@ -126,8 +131,9 @@ GET /api/presentations/me/registrations/
 
 ## پرداخت
 
-- لینک پرداخت فقط وقتی نمایش داده شود که `status === "APPROVED"` و
-  `payment_link` خالی نباشد.
+- برای `APPROVED` دکمه پرداخت نمایش داده و هنگام کلیک، endpoint زیر فراخوانی شود:
+  `POST /api/presentations/me/registrations/{id}/payment/`.
+- redirect فقط با `payment_link` پاسخ `201` همین endpoint انجام شود.
 - برای `RESERVED` هرگز مسیر پرداخت آغاز نشود؛ این وضعیت هنوز slot رزروشده ندارد.
 - جریان callback و verify فعلی پرداخت حفظ شود.
 - بعد از پرداخت موفق، registration باید دوباره fetch و وضعیت `FINAL` نمایش داده
@@ -149,7 +155,7 @@ GET /api/presentations/me/registrations/
 - ثبت‌نام در offering پر و نمایش موقعیت صف.
 - فعال بودن CTA ورود به صف وقتی `remained_capacity` صفر است.
 - عدم نمایش پرداخت برای `RESERVED`.
-- نمایش پرداخت برای `APPROVED` و عدم نمایش آن برای `FINAL`.
+- نمایش پرداخت برای `APPROVED` حتی با `payment_link` خالی و عدم نمایش آن برای `FINAL`.
 - تغییر UI از `RESERVED` به `APPROVED` پس از refetch.
 - تغییر موقعیت صف پس از refetch.
 - عدم نمایش approval دستی حتی اگر fixture قدیمی `requires_approval: true` داشته

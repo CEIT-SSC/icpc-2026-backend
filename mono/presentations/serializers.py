@@ -166,6 +166,16 @@ class RegistrationSerializer(serializers.ModelSerializer):
         return settings.PAYMENT_CURRENCY
 
 
+class RegistrationPaymentSerializer(serializers.Serializer):
+    registration_id = serializers.IntegerField()
+    payment_id = serializers.IntegerField()
+    authority = serializers.CharField()
+    payment_link = serializers.URLField()
+    amount = serializers.IntegerField()
+    currency = serializers.CharField()
+    status = serializers.CharField()
+
+
 class SkyroomLinkGeneratorSerializer(serializers.Serializer):
     course_id = serializers.CharField(max_length=100)
 

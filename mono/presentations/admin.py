@@ -93,7 +93,6 @@ class RegistrationAdmin(admin.ModelAdmin):
         "user_last_name",
         "user_phone",
         "price",
-        "status",
         "submitted_at",
         "decided_at",
         "payment_link",

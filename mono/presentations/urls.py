@@ -5,6 +5,7 @@ from .views import (
     CourseSessionsView,
     MyRegistrationsView,
     RegistrationCreateView,
+    RegistrationPaymentView,
     SkyroomLinkView,
 )
 
@@ -17,5 +18,10 @@ urlpatterns = [
     path("register/", RegistrationCreateView.as_view()),
     # List my registrations
     path("me/registrations/", MyRegistrationsView.as_view()),
+    # Explicitly create a payment link when the owner chooses to pay.
+    path(
+        "me/registrations/<int:registration_id>/payment/",
+        RegistrationPaymentView.as_view(),
+    ),
     path("participation/link/", SkyroomLinkView.as_view())
 ]

@@ -241,7 +241,7 @@ class Registration(models.Model):
     # set by backoffice on reject
     rejection_reason = models.TextField(blank=True)
 
-    # set by backoffice on approve; payment app will generate proper link later
+    # Populated only after the owner explicitly starts payment.
     payment_link = models.URLField(blank=True)
 
     submitted_at = models.DateTimeField(default=timezone.now)

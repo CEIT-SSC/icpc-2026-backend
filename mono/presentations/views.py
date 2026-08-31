@@ -13,10 +13,16 @@ from .models import Course, CourseSession, Registration
 from .serializers import (
     CourseSerializer,
     RegistrationCreateSerializer,
+    RegistrationPaymentSerializer,
     RegistrationSerializer, SkyroomLinkGeneratorSerializer, SkyroomLinkGeneratorResponseSerializer,
     CourseSessionSerializer, CourseSessionResponseSerializer,
 )
-from .services import submit_registration, create_skyroom_link, get_course_sessions
+from .services import (
+    create_skyroom_link,
+    get_course_sessions,
+    initiate_registration_payment,
+    submit_registration,
+)
 
 User = get_user_model()
 
@@ -109,6 +115,43 @@ class RegistrationCreateView(APIView):
             return Response(RegistrationSerializer(reg).data, status=status.HTTP_200_OK)
         except ValidationError as e:
             return Response({"error": str(e.message)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class RegistrationPaymentView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @extend_schema(
+        request=None,
+        responses={
+            201: RegistrationPaymentSerializer,
+            404: OpenApiResponse(description="Registration not found for this user"),
+            409: OpenApiResponse(
+                description="Registration is not payment-eligible or capacity is unavailable"
+            ),
+        },
+        description=(
+            "Create a payment gateway link on demand for the authenticated user's "
+            "approved registration. No request body is required."
+        ),
+    )
+    def post(self, request, registration_id: int):
+        result = initiate_registration_payment(
+            registration_id=registration_id,
+            user=request.user,
+        )
+        payload = {
+            "registration_id": registration_id,
+            "payment_id": result.payment.id,
+            "authority": result.authority,
+            "payment_link": result.url,
+            "amount": result.payment.amount,
+            "currency": result.payment.currency,
+            "status": result.payment.status,
+        }
+        return Response(
+            RegistrationPaymentSerializer(payload).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class SkyroomLinkView(APIView):

@@ -158,7 +158,6 @@ def _schedule_status_email(
 def _schedule_promotion_email(reg: Registration) -> None:
     to = reg.user.email
     course_name = reg.course.name
-    payment_link = reg.payment_link
     deduplication_key = f"course-waitlist-promoted:{reg.id}"
 
     def send_after_commit():
@@ -168,8 +167,6 @@ def _schedule_promotion_email(reg: Registration) -> None:
             status_code="COURSE_WAITLIST_PROMOTED",
             extra={
                 "course": course_name,
-                "payment_link": payment_link,
-                "link": payment_link,
             },
             deduplication_key=deduplication_key,
         )
@@ -189,12 +186,10 @@ def _schedule_waitlist_promotion(course_id: int) -> None:
 def _progress_locked_registration(
     reg: Registration,
     *,
-    payment_link: str | None = None,
     override_amount: int | None = None,
-    description: str | None = None,
     promoted: bool = False,
 ) -> Registration:
-    """Claim the locked seat and issue payment without any approval step."""
+    """Claim the locked seat without contacting the payment gateway."""
     _validate_individual_offering(reg.course, [])
     if reg.items.exists():
         raise CustomAPIException(
@@ -205,32 +200,16 @@ def _progress_locked_registration(
 
     amount = override_amount if override_amount is not None else _compute_total_amount(reg)
     now = timezone.now()
-    if amount <= 0 and payment_link is None:
+    if amount <= 0:
         reg.status = Registration.Status.FINAL
         reg.payment_link = ""
         reg.decided_at = now
         reg.save(update_fields=["status", "payment_link", "decided_at"])
     else:
-        # APPROVED is the seat-holding/payment-eligible state. Saving it before
-        # gateway initiation also lets the nested payment service see the claim;
-        # any gateway exception rolls this transaction back atomically.
+        # APPROVED means that the seat is held and the user may explicitly start
+        # payment. Gateway initiation is deliberately deferred until that action.
         reg.status = Registration.Status.APPROVED
-        reg.save(update_fields=["status"])
-        if payment_link is None:
-            payment_result = initiate_payment_for_target(
-                user=reg.user,
-                target_type=Payment.TargetType.COURSE,
-                target_id=str(reg.id),
-                amount=amount,
-                description=description or _compose_description(reg),
-                extra_metadata={
-                    "reg_id": reg.id,
-                    "course_id": reg.course_id,
-                },
-            )
-            reg.payment_link = payment_result.url
-        else:
-            reg.payment_link = payment_link
+        reg.payment_link = ""
         reg.decided_at = now
         reg.save(update_fields=["status", "payment_link", "decided_at"])
 
@@ -242,15 +221,10 @@ def _progress_locked_registration(
             if reg.status == Registration.Status.FINAL
             else "COURSE_REQUEST_APPROVED"
         )
-        email_extra = {"course": reg.course.name}
-        if reg.payment_link:
-            email_extra.update(
-                {"payment_link": reg.payment_link, "link": reg.payment_link}
-            )
         _schedule_status_email(
             to=reg.user.email,
             status_code=email_status,
-            extra=email_extra,
+            extra={"course": reg.course.name},
         )
     return reg
 
@@ -362,7 +336,6 @@ def submit_registration(
         reg = _progress_locked_registration(
             reg,
             override_amount=_compute_total_amount(reg),
-            description=_compose_description(reg),
         )
     return reg
 
@@ -384,9 +357,7 @@ def set_status_approved(
     reg: Registration,
     *,
     actor: User | None = None,
-    payment_link: str | None = None,
     override_amount: int | None = None,
-    description: str | None = None,
 ) -> Registration:
     course = Course.objects.select_for_update().get(pk=reg.course_id)
     reg = (
@@ -408,10 +379,77 @@ def set_status_approved(
     _validate_capacity([reg], {course.id: course})
     return _progress_locked_registration(
         reg,
-        payment_link=payment_link,
         override_amount=override_amount,
-        description=description,
     )
+
+
+@transaction.atomic
+def initiate_registration_payment(*, registration_id: int, user: User):
+    """Create a gateway payment only after the registration owner asks to pay."""
+    course_id = Registration.objects.filter(
+        id=registration_id,
+        user=user,
+    ).values_list("course_id", flat=True).first()
+    if course_id is None:
+        raise CustomAPIException(
+            code=EC.PAY_NOT_OWNED,
+            message="Registration not found for this user.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    course = Course.objects.select_for_update().get(pk=course_id)
+    reg = (
+        Registration.objects.select_for_update()
+        .select_related("course", "user")
+        .prefetch_related("items__child_course")
+        .get(id=registration_id, user=user)
+    )
+
+    # A cancelled payment released its seat. A deliberate retry may reclaim it,
+    # but only if capacity and FIFO waitlist priority still allow it.
+    if reg.status == Registration.Status.CANCELLED:
+        first_waitlisted = _first_waitlisted_locked(course)
+        if first_waitlisted is not None:
+            raise CustomAPIException(
+                code=EC.REG_CAPACITY_UNAVAILABLE,
+                message="Waitlisted registrations have priority for the next slot.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        _validate_capacity([reg], {course.id: course})
+        reg.status = Registration.Status.APPROVED
+        reg.payment_link = ""
+        reg.decided_at = timezone.now()
+        reg.save(update_fields=["status", "payment_link", "decided_at"])
+
+    if reg.status != Registration.Status.APPROVED:
+        raise CustomAPIException(
+            code=EC.REG_PAYMENT_NOT_AVAILABLE,
+            message="Payment is available only for approved registrations.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    amount = _compute_total_amount(reg)
+    if amount <= 0:
+        raise CustomAPIException(
+            code=EC.REG_PAYMENT_NOT_AVAILABLE,
+            message="This registration does not require payment.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    result = initiate_payment_for_target(
+        user=reg.user,
+        target_type=Payment.TargetType.COURSE,
+        target_id=str(reg.id),
+        amount=amount,
+        description=_compose_description(reg),
+        extra_metadata={
+            "reg_id": reg.id,
+            "course_id": reg.course_id,
+        },
+    )
+    reg.payment_link = result.url
+    reg.save(update_fields=["payment_link"])
+    return result
 
 
 @transaction.atomic
@@ -438,7 +476,6 @@ def promote_waitlist(*, course_id: int) -> list[Registration]:
             _progress_locked_registration(
                 reg,
                 override_amount=_compute_total_amount(reg),
-                description=_compose_description(reg),
                 promoted=True,
             )
         )

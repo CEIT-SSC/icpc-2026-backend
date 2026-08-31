@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.admin.sites import AdminSite
 from django.core.exceptions import ValidationError
 from django.db import close_old_connections
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
@@ -11,8 +12,10 @@ from rest_framework.test import APIClient
 from acm import error_codes as EC
 from acm.exceptions import CustomAPIException
 from .models import Course, Registration
+from .admin import RegistrationAdmin
 from .serializers import RegistrationSerializer
 from .services import (
+    initiate_registration_payment,
     promote_waitlist,
     set_status_approved,
     set_status_final,
@@ -91,12 +94,20 @@ class IndividualOfferingTests(TestCase):
                 self.assertEqual(reg.status, Registration.Status.APPROVED)
                 self.assertEqual(reg.price, price)
                 self.assertFalse(reg.items.exists())
+                self.assertEqual(reg.payment_link, "")
+
+                result = initiate_registration_payment(
+                    registration_id=reg.id,
+                    user=user,
+                )
+
+                self.assertEqual(result.url, "https://payment.example/start")
                 call = self.initiate_payment.call_args_list[-1].kwargs
                 self.assertEqual(call["amount"], price)
                 self.assertEqual(call["target_id"], str(reg.id))
                 self.assertEqual(call["extra_metadata"]["reg_id"], reg.id)
 
-    def test_capacity_available_ignores_legacy_manual_approval_setting(self):
+    def test_capacity_available_approves_without_starting_payment(self):
         course = self.make_course(
             Course.OfferingType.ONLINE_WORKSHOP,
             "legacy-approval",
@@ -107,8 +118,8 @@ class IndividualOfferingTests(TestCase):
         reg = submit_registration(course=course, user=self.make_user("auto-pay"))
 
         self.assertEqual(reg.status, Registration.Status.APPROVED)
-        self.assertEqual(reg.payment_link, "https://payment.example/start")
-        self.initiate_payment.assert_called_once()
+        self.assertEqual(reg.payment_link, "")
+        self.initiate_payment.assert_not_called()
 
     def test_free_registration_finalizes_automatically(self):
         course = self.make_course(
@@ -137,7 +148,7 @@ class IndividualOfferingTests(TestCase):
         self.assertEqual(first.status, Registration.Status.APPROVED)
         self.assertEqual(second.status, Registration.Status.RESERVED)
         self.assertEqual(course.remained_capacity(), 0)
-        self.assertEqual(self.initiate_payment.call_count, 1)
+        self.assertEqual(self.initiate_payment.call_count, 0)
         self.assertEqual(second.waitlist_position(), 1)
 
         with self.assertRaises(CustomAPIException) as raised:
@@ -214,7 +225,7 @@ class IndividualOfferingTests(TestCase):
         self.assertEqual(parent.remained_capacity(), 1)
         self.assertEqual(child.remained_capacity(), 1)
 
-    def test_payment_initiation_failure_rolls_back_the_seat_claim(self):
+    def test_payment_initiation_failure_keeps_the_approved_seat_claim(self):
         course = self.make_course(
             Course.OfferingType.IN_PERSON_WORKSHOP,
             "rollback",
@@ -226,11 +237,16 @@ class IndividualOfferingTests(TestCase):
             status_code=409,
         )
 
-        with self.assertRaises(CustomAPIException):
-            submit_registration(course=course, user=self.make_user("rollback"))
+        user = self.make_user("rollback")
+        reg = submit_registration(course=course, user=user)
 
-        self.assertEqual(Registration.objects.count(), 0)
-        self.assertEqual(course.remained_capacity(), 1)
+        with self.assertRaises(CustomAPIException):
+            initiate_registration_payment(registration_id=reg.id, user=user)
+
+        reg.refresh_from_db()
+        self.assertEqual(reg.status, Registration.Status.APPROVED)
+        self.assertEqual(reg.payment_link, "")
+        self.assertEqual(course.remained_capacity(), 0)
 
     def test_registration_uses_price_snapshot(self):
         course = self.make_course(
@@ -446,6 +462,95 @@ class OfferingAPITests(TestCase):
         self.assertEqual(response.data["status"], Registration.Status.RESERVED)
         self.assertEqual(response.data["waitlist_position"], 1)
         self.assertEqual(response.data["payment_link"], "")
+
+    @patch("presentations.services.initiate_payment_for_target")
+    def test_payment_api_creates_link_only_when_user_asks(self, initiate):
+        registration_response = self.client.post(
+            "/api/presentations/register/",
+            {"course_id": self.course.id},
+            format="json",
+        )
+        registration_id = registration_response.data["id"]
+
+        self.assertEqual(registration_response.status_code, 200)
+        self.assertEqual(
+            registration_response.data["status"],
+            Registration.Status.APPROVED,
+        )
+        self.assertEqual(registration_response.data["payment_link"], "")
+        initiate.assert_not_called()
+
+        initiate.return_value = SimpleNamespace(
+            url="https://payment.example/on-demand",
+            authority="ON-DEMAND-AUTHORITY",
+            payment=SimpleNamespace(
+                id=17,
+                amount=self.course.price,
+                currency="IRT",
+                status="PENDING",
+            ),
+        )
+        payment_response = self.client.post(
+            f"/api/presentations/me/registrations/{registration_id}/payment/",
+            format="json",
+        )
+
+        self.assertEqual(payment_response.status_code, 201)
+        self.assertEqual(
+            payment_response.data["payment_link"],
+            "https://payment.example/on-demand",
+        )
+        self.assertEqual(payment_response.data["authority"], "ON-DEMAND-AUTHORITY")
+        initiate.assert_called_once()
+        registration = Registration.objects.get(id=registration_id)
+        self.assertEqual(registration.payment_link, payment_response.data["payment_link"])
+
+    @patch("presentations.services.initiate_payment_for_target")
+    def test_payment_api_does_not_expose_another_users_registration(self, initiate):
+        other_user = get_user_model().objects.create_user(
+            email="another-buyer@example.com",
+            is_email_verified=True,
+        )
+        registration = Registration.objects.create(
+            course=self.course,
+            user=other_user,
+            price=self.course.price,
+            status=Registration.Status.APPROVED,
+        )
+
+        response = self.client.post(
+            f"/api/presentations/me/registrations/{registration.id}/payment/",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["errorCode"], EC.PAY_NOT_OWNED)
+        initiate.assert_not_called()
+
+    @patch("presentations.services.initiate_payment_for_target")
+    def test_payment_api_rejects_waitlisted_registration(self, initiate):
+        registration = Registration.objects.create(
+            course=self.course,
+            user=self.user,
+            price=self.course.price,
+            status=Registration.Status.RESERVED,
+        )
+
+        response = self.client.post(
+            f"/api/presentations/me/registrations/{registration.id}/payment/",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["errorCode"], EC.REG_PAYMENT_NOT_AVAILABLE)
+        initiate.assert_not_called()
+
+
+class RegistrationAdminTests(TestCase):
+    def test_status_is_editable_in_registration_change_form(self):
+        registration_admin = RegistrationAdmin(Registration, AdminSite())
+
+        self.assertNotIn("status", registration_admin.get_readonly_fields(None))
 
 
 @skipUnlessDBFeature("has_select_for_update")

@@ -334,16 +334,14 @@ def startpay(authority: str) -> str:
             status_code=404)
     try:
         if current_payment.target_type == Payment.TargetType.COURSE:
-            from presentations.models import Registration
-            from presentations.services import set_status_approved
+            from presentations.services import initiate_registration_payment
 
             reg_id = (current_payment.metadata or {}).get("reg_id")
-            reg = Registration.objects.get(
-                id=int(reg_id),
+            result = initiate_registration_payment(
+                registration_id=int(reg_id),
                 user=current_payment.user,
             )
-            if reg.status != Registration.Status.APPROVED:
-                return set_status_approved(reg).payment_link
+            return result.url
 
         new_payment = initiate_payment_for_target(
             user=current_payment.user,

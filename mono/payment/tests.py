@@ -161,9 +161,8 @@ class CoursePaymentLifecycleTests(TestCase):
         self.assertEqual(self.course.remained_capacity(), 1)
 
     @patch("presentations.services.send_email_with_custom_template")
-    @patch("presentations.services.initiate_payment_for_target")
     def test_failed_payment_promotes_the_next_waitlisted_registration(
-        self, initiate, promotion_email
+        self, promotion_email
     ):
         waiting_user = get_user_model().objects.create_user(
             email="next-payer@example.com",
@@ -175,8 +174,6 @@ class CoursePaymentLifecycleTests(TestCase):
             price=self.course.price,
             status=Registration.Status.RESERVED,
         )
-        initiate.return_value.url = "https://payment.example/promoted"
-
         with self.captureOnCommitCallbacks(execute=True):
             process_gateway_callback(
                 authority=self.payment.authority,
@@ -187,7 +184,7 @@ class CoursePaymentLifecycleTests(TestCase):
         waiting.refresh_from_db()
         self.assertEqual(self.registration.status, Registration.Status.CANCELLED)
         self.assertEqual(waiting.status, Registration.Status.APPROVED)
-        self.assertEqual(waiting.payment_link, "https://payment.example/promoted")
+        self.assertEqual(waiting.payment_link, "")
         self.assertEqual(self.course.remained_capacity(), 0)
         promotion_email.assert_called_once()
 
