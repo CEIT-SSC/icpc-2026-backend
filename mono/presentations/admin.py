@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils import timezone
 
 from .models import Course, Presenter, ScheduleRule, Registration, CourseSession
-from .services import set_status_rejected, set_status_final
+from .services import set_status_approved, set_status_rejected, set_status_final
 
 
 
@@ -124,7 +124,7 @@ class RegistrationAdmin(admin.ModelAdmin):
     )
 
     
-    actions = ("reject_selected", "finalize_selected")
+    actions = ("approve_selected", "reject_selected", "finalize_selected")
 
     
 
@@ -151,6 +151,18 @@ class RegistrationAdmin(admin.ModelAdmin):
         return getattr(obj.user, "phone_number", "") or ""
 
     
+
+    def approve_selected(self, request, queryset):
+        count = 0
+        for reg in queryset.select_related("course", "user"):
+            set_status_approved(reg, actor=request.user)
+            count += 1
+        self.message_user(request, f"Approved {count} registration(s)")
+    approve_selected.short_description = (
+        "Approve (payment link is created when the user chooses to pay)"
+    )
+
+
 
     def reject_selected(self, request, queryset):
         count = 0

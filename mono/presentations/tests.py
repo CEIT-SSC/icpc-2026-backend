@@ -6,7 +6,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.admin.sites import AdminSite
 from django.core.exceptions import ValidationError
 from django.db import close_old_connections
-from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
+from django.test import RequestFactory, TestCase, TransactionTestCase, skipUnlessDBFeature
 from rest_framework.test import APIClient
 
 from acm import error_codes as EC
@@ -551,6 +551,44 @@ class RegistrationAdminTests(TestCase):
         registration_admin = RegistrationAdmin(Registration, AdminSite())
 
         self.assertNotIn("status", registration_admin.get_readonly_fields(None))
+
+    @patch("presentations.services.initiate_payment_for_target")
+    def test_approve_action_approves_without_creating_payment_link(self, initiate):
+        admin_user = get_user_model().objects.create_superuser(
+            email="registration-admin@example.com",
+            password="password",
+        )
+        buyer = get_user_model().objects.create_user(
+            email="admin-approved-buyer@example.com",
+            is_email_verified=True,
+        )
+        course = Course.objects.create(
+            name="Admin-approved workshop",
+            offering_type=Course.OfferingType.ONLINE_WORKSHOP,
+            capacity=1,
+        )
+        registration = Registration.objects.create(
+            course=course,
+            user=buyer,
+            price=course.price,
+            status=Registration.Status.QUEUED,
+        )
+        request = RequestFactory().post("/api/admin/presentations/registration/")
+        request.user = admin_user
+        registration_admin = RegistrationAdmin(Registration, AdminSite())
+
+        with patch.object(registration_admin, "message_user") as message_user:
+            registration_admin.approve_selected(
+                request,
+                Registration.objects.filter(id=registration.id),
+            )
+
+        registration.refresh_from_db()
+        self.assertEqual(registration.status, Registration.Status.APPROVED)
+        self.assertEqual(registration.payment_link, "")
+        initiate.assert_not_called()
+        message_user.assert_called_once_with(request, "Approved 1 registration(s)")
+        self.assertIn("approve_selected", registration_admin.actions)
 
 
 @skipUnlessDBFeature("has_select_for_update")
