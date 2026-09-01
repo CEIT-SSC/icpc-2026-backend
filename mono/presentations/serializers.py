@@ -247,3 +247,6 @@ class CourseSessionSerializer(serializers.ModelSerializer):
 
 class CourseSessionResponseSerializer(serializers.Serializer):
     sessions = CourseSessionSerializer(many=True, read_only=True)
+
+class RegisterCourseSerializer(serializers.Serializer):
+    discount_code = serializers.CharField(required=False, allow_blank=True)
