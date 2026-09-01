@@ -4,6 +4,9 @@
 !.env.example
 /mono/.env
 !/mono/.env.example
+docker-compose.yml
+mysql-backup.md
+prompt.txt
 
 # Python artifacts
 __pycache__/
