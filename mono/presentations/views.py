@@ -4,12 +4,11 @@ from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework import generics, permissions, status
-from django.core.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Course, CourseSession, Registration
+from .models import Course, CourseSession, Registration, attach_capacity_snapshots
 from .serializers import (
     CourseSerializer,
     RegistrationCreateSerializer,
@@ -30,8 +29,17 @@ User = get_user_model()
 def purchasable_offerings():
     return Course.objects.filter(
         is_active=True,
-        offering_type__in=Course.OfferingType.values,
-    ).prefetch_related("presenters", "schedule")
+        bundle_type__in=Course.BundleType.values,
+        offering_type__isnull=True,
+        capacity__isnull=True,
+        price__isnull=False,
+    ).prefetch_related(
+        "presenters",
+        "schedule",
+        "children__presenters",
+        "children__schedule",
+        "children__parents",
+    )
 
 
 class CourseListView(generics.ListAPIView):
@@ -39,11 +47,16 @@ class CourseListView(generics.ListAPIView):
     permission_classes = []
 
     def get_queryset(self):
-        return purchasable_offerings().order_by("start_date", "id")
+        return purchasable_offerings().order_by("id")
+
+    def list(self, request, *args, **kwargs):
+        bundles = [course for course in self.get_queryset() if course.is_valid_bundle()]
+        attach_capacity_snapshots(bundles)
+        return Response(self.get_serializer(bundles, many=True).data)
 
     @extend_schema(
         responses={200: CourseSerializer(many=True)},
-        description="List the individually purchasable presentations and workshops.",
+        description="List the three active, valid all-access bundles.",
     )
     def get(self, *args, **kwargs):
         return super().get(*args, **kwargs)
@@ -55,9 +68,18 @@ class CourseDetailView(generics.RetrieveAPIView):
     lookup_field = "slug"
     permission_classes = []
 
+    def get_object(self):
+        course = super().get_object()
+        if not course.is_valid_bundle():
+            from django.http import Http404
+
+            raise Http404
+        attach_capacity_snapshots([course])
+        return course
+
     @extend_schema(
         responses={200: CourseSerializer},
-        description="Get a course by slug (with presenters & schedule)."
+        description="Get a purchasable bundle by slug, including members and schedule."
     )
     def get(self, *args, **kwargs):
         return super().get(*args, **kwargs)
@@ -73,8 +95,52 @@ class MyRegistrationsView(generics.ListAPIView):
         return (
             Registration.objects.filter(user=self.request.user)
             .select_related("course")
-            .prefetch_related("items__child_course")
+            .prefetch_related(
+                "course__presenters",
+                "course__schedule",
+                "course__children__presenters",
+                "course__children__schedule",
+                "course__children__parents",
+                "items__child_course__presenters",
+                "items__child_course__schedule",
+            )
         )
+
+    def list(self, request, *args, **kwargs):
+        registrations = list(self.get_queryset())
+        waitlisted_ids = {
+            registration.id
+            for registration in registrations
+            if registration.status == Registration.Status.RESERVED
+        }
+        positions = {}
+        next_position = {}
+        if waitlisted_ids:
+            course_ids = {
+                registration.course_id
+                for registration in registrations
+                if registration.id in waitlisted_ids
+            }
+            for registration_id, course_id in Registration.objects.filter(
+                course_id__in=course_ids,
+                status=Registration.Status.RESERVED,
+            ).order_by("course_id", "submitted_at", "id").values_list(
+                "id", "course_id"
+            ):
+                next_position[course_id] = next_position.get(course_id, 0) + 1
+                if registration_id in waitlisted_ids:
+                    positions[registration_id] = next_position[course_id]
+            for registration in registrations:
+                if registration.id in positions:
+                    registration._waitlist_position_snapshot = positions[registration.id]
+        capacity_courses = []
+        for registration in registrations:
+            capacity_courses.append(registration.course)
+            capacity_courses.extend(
+                item.child_course for item in registration.items.all()
+            )
+        attach_capacity_snapshots(capacity_courses)
+        return Response(self.get_serializer(registrations, many=True).data)
 
     @extend_schema(
         responses={200: RegistrationSerializer(many=True)},
@@ -97,24 +163,36 @@ class RegistrationCreateView(APIView):
         description="Submit a registration for a course. Also persists extra answers to UserExtraData."
     )
     def post(self, request):
-        try:
-            s = RegistrationCreateSerializer(data=request.data)
-            s.is_valid(raise_exception=True)
-            data = s.validated_data
-            course = get_object_or_404(
-                Course,
-                id=data["course_id"],
-                is_active=True,
-                offering_type__in=Course.OfferingType.values,
+        serializer = RegistrationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        course = get_object_or_404(
+            Course,
+            id=data["course_id"],
+            is_active=True,
+        )
+        reg = submit_registration(
+            course=course,
+            user=request.user,
+            extra_updates=data.get("extra_answers"),
+        )
+        reg = (
+            Registration.objects.select_related("course")
+            .prefetch_related(
+                "course__presenters",
+                "course__schedule",
+                "course__children__presenters",
+                "course__children__schedule",
+                "course__children__parents",
+                "items__child_course__presenters",
+                "items__child_course__schedule",
             )
-            reg = submit_registration(
-                course=course,
-                user=request.user,
-                extra_updates=data.get("extra_answers"),
-            )
-            return Response(RegistrationSerializer(reg).data, status=status.HTTP_200_OK)
-        except ValidationError as e:
-            return Response({"error": str(e.message)}, status=status.HTTP_400_BAD_REQUEST)
+            .get(pk=reg.pk)
+        )
+        attach_capacity_snapshots(
+            [reg.course, *(item.child_course for item in reg.items.all())]
+        )
+        return Response(RegistrationSerializer(reg).data, status=status.HTTP_200_OK)
 
 
 class RegistrationPaymentView(APIView):
