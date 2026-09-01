@@ -21,6 +21,8 @@ from .services import (
     get_course_sessions,
     initiate_registration_payment,
     submit_registration,
+    validate_and_apply_discount,
+    InvalidDiscountCode,
 )
 
 User = get_user_model()
@@ -283,3 +285,18 @@ class CourseSessionsView(generics.ListAPIView):
         if current_sessions is None:
             return Response(status=status.HTTP_400_BAD_REQUEST, data={"detail": "User's not registered for this course"})
         return Response(current_sessions, status=status.HTTP_200_OK)
+
+class ValidateDiscountView(APIView):
+    def post(self, request):
+        course_id = request.data.get("course_id")
+        code = request.data.get("code")
+        course = get_object_or_404(Course, id=course_id)
+        try:
+            final_price, discount = validate_and_apply_discount(course, code)
+        except InvalidDiscountCode as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response({
+            "valid": True,
+            "original_price": course.price,
+            "final_price": final_price,
+        })
