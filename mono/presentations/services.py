@@ -22,8 +22,10 @@ from .models import (
     BUNDLE_CATALOG,
     Course,
     CourseSession,
+    DiscountCode,
     Registration,
     RegistrationItem,
+    _taken_seats,
 )
 
 User = get_user_model()
@@ -262,7 +264,11 @@ def _progress_locked_registration(
     promoted: bool = False,
 ) -> Registration:
     """Progress an existing, already-validated snapshot without sale validation."""
-    amount = override_amount if override_amount is not None else _compute_total_amount(reg)
+    amount = (
+        override_amount
+        if override_amount is not None
+        else _compute_total_amount(reg)
+    )
     now = timezone.now()
     reg.status = (
         Registration.Status.FINAL if amount <= 0 else Registration.Status.APPROVED
@@ -329,7 +335,9 @@ def submit_registration(
     )
     members = list(candidate.bundle_members())
     tentative_claim_ids = (
-        _claim_course_ids(existing) if existing is not None else {m.id for m in members}
+        _claim_course_ids(existing)
+        if existing is not None
+        else {member.id for member in members}
     )
     locked_courses = _lock_courses({candidate.id, *tentative_claim_ids})
     course = locked_courses[candidate.id]
@@ -409,7 +417,10 @@ def submit_registration(
         },
     )
     if reg.status == Registration.Status.QUEUED:
-        reg = _progress_locked_registration(reg, override_amount=_compute_total_amount(reg))
+        reg = _progress_locked_registration(
+            reg,
+            override_amount=_compute_total_amount(reg),
+        )
     return reg
 
 
@@ -791,3 +802,23 @@ def get_skyroom_presentation_link(
     response = requests.post(url, json=payload, headers=HEADERS, timeout=20)
     response.raise_for_status()
     return response.json().get("result", None)
+
+
+class InvalidDiscountCode(Exception):
+    pass
+
+
+def validate_and_apply_discount(course: Course, code: str):
+    """Return the discounted price and code, or raise InvalidDiscountCode."""
+    try:
+        discount = DiscountCode.objects.get(code=code)
+    except DiscountCode.DoesNotExist:
+        raise InvalidDiscountCode("کد تخفیف یافت نشد")
+
+    if not discount.is_valid():
+        raise InvalidDiscountCode("کد تخفیف منقضی یا غیرفعال است")
+
+    if discount.course and discount.course_id != course.id:
+        raise InvalidDiscountCode("این کد برای این دوره معتبر نیست")
+
+    return discount.apply(course.price), discount
