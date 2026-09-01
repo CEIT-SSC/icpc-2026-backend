@@ -662,3 +662,35 @@ def _is_full_by_count(course) -> bool:
     if cap == 0:
         return True
     return _taken_seats(course) >= cap
+
+
+class DiscountCode(models.Model):
+    code = models.CharField(max_length=32, unique=True)
+    percent_off = models.PositiveIntegerField(null=True, blank=True)  # the prcentage discount 
+    amount_off = models.PositiveIntegerField(null=True, blank=True)   # mizanesh
+    max_uses = models.PositiveIntegerField(null=True, blank=True)
+    used_count = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    valid_from = models.DateTimeField(null=True, blank=True)
+    valid_until = models.DateTimeField(null=True, blank=True)
+    # اختیاری: محدود به یک دوره خاص
+    course = models.ForeignKey(Course, null=True, blank=True, on_delete=models.CASCADE, related_name="discount_codes")
+
+    def is_valid(self):
+        now = timezone.now()
+        if not self.is_active:
+            return False
+        if self.valid_from and now < self.valid_from:
+            return False
+        if self.valid_until and now > self.valid_until:
+            return False
+        if self.max_uses is not None and self.used_count >= self.max_uses:
+            return False
+        return True
+
+    def apply(self, price: int) -> int:
+        if self.percent_off:
+            return max(0, price - (price * self.percent_off // 100))
+        if self.amount_off:
+            return max(0, price - self.amount_off)
+        return price
