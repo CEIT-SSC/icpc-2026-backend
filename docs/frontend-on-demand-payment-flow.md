@@ -4,6 +4,9 @@ This document is the complete frontend contract for the new course-registration
 payment flow. It supersedes the payment-link instructions in the older individual
 offering and capacity/waitlist documents.
 
+For registrations using discount codes, also follow
+[`frontend-discount-code-integration.md`](frontend-discount-code-integration.md).
+
 ## What changed
 
 Creating or approving a paid registration no longer contacts the payment gateway.

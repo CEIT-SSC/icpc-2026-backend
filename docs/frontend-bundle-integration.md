@@ -6,6 +6,9 @@ the frontend's existing Axios instance, JWT refresh/interceptors, routes,
 localization, visual system, error presentation, registration history, FIFO
 waitlist behavior, and on-demand payment flow.
 
+For the complete discount request and payment contract, see
+[`frontend-discount-code-integration.md`](frontend-discount-code-integration.md).
+
 This document supersedes the individual-purchase parts of
 `frontend-individual-offerings-prompt.md`. The waitlist behavior in
 `frontend-registration-capacity-waitlist.md` and the payment behavior in
@@ -155,6 +158,7 @@ export interface Registration {
   course: HistoricalProduct;
   user: number;
   price: number | null; // immutable purchase-price snapshot
+  discount_code: string | null;
   currency: "IRT";
   status: RegistrationStatus;
   waitlist_position: number | null;
@@ -169,7 +173,15 @@ export interface Registration {
 
 export interface CreateBundleRegistrationRequest {
   course_id: number;
+  discount_code?: string;
   extra_answers?: Record<string, unknown>;
+}
+
+export interface DiscountValidation {
+  valid: true;
+  code: string;
+  original_price: number;
+  final_price: number;
 }
 
 export interface RegistrationPaymentStart {
@@ -211,6 +223,15 @@ const createBundleRegistration = async (
 ): Promise<Registration> =>
   (await api.post<Registration>("/api/presentations/register/", payload)).data;
 
+const validateDiscount = async (
+  courseId: number,
+  code: string,
+): Promise<DiscountValidation> =>
+  (await api.post<DiscountValidation>("/api/presentations/discount/validate/", {
+    course_id: courseId,
+    code,
+  })).data;
+
 const listMyRegistrations = async (): Promise<Registration[]> =>
   (await api.get<Registration[]>(
     "/api/presentations/me/registrations/",
@@ -225,8 +246,21 @@ const startRegistrationPayment = async (
 ```
 
 Do not send a body to the payment-start endpoint. Catalogue/detail are public;
-registration, history, and payment start use the existing Bearer access token.
-Creating a registration also requires a verified email.
+discount validation, registration, history, and payment start use the existing
+Bearer access token. Creating a registration also requires a verified email.
+
+## Discount codes
+
+Validate a code for immediate UI feedback, then include the same code as
+`discount_code` in the registration request. Validation does not reserve or
+consume the code; registration does. Treat registration as authoritative because
+a limited code can become unavailable between validation and submission.
+
+The backend normalizes codes by trimming whitespace and converting to uppercase.
+Use `Registration.price` and `total_amount` after submission as the final,
+snapshotted amount. Do not calculate the discount in the frontend, and do not
+send the code to the payment-start endpoint. A zero-price discounted registration
+is finalized immediately and does not have a payment step.
 
 ## Catalogue layout
 

@@ -4,13 +4,14 @@ from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework import generics, permissions, status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Course, CourseSession, Registration, attach_capacity_snapshots
 from .serializers import (
     CourseSerializer,
+    DiscountValidationResponseSerializer,
+    DiscountValidationSerializer,
     RegistrationCreateSerializer,
     RegistrationPaymentSerializer,
     RegistrationSerializer, SkyroomLinkGeneratorSerializer, SkyroomLinkGeneratorResponseSerializer,
@@ -21,6 +22,7 @@ from .services import (
     get_course_sessions,
     initiate_registration_payment,
     submit_registration,
+    validate_and_apply_discount,
 )
 
 User = get_user_model()
@@ -94,7 +96,7 @@ class MyRegistrationsView(generics.ListAPIView):
             return Registration.objects.none()
         return (
             Registration.objects.filter(user=self.request.user)
-            .select_related("course")
+            .select_related("course", "discount_code")
             .prefetch_related(
                 "course__presenters",
                 "course__schedule",
@@ -175,9 +177,10 @@ class RegistrationCreateView(APIView):
             course=course,
             user=request.user,
             extra_updates=data.get("extra_answers"),
+            discount_code=data.get("discount_code"),
         )
         reg = (
-            Registration.objects.select_related("course")
+            Registration.objects.select_related("course", "discount_code")
             .prefetch_related(
                 "course__presenters",
                 "course__schedule",
@@ -283,3 +286,38 @@ class CourseSessionsView(generics.ListAPIView):
         if current_sessions is None:
             return Response(status=status.HTTP_400_BAD_REQUEST, data={"detail": "User's not registered for this course"})
         return Response(current_sessions, status=status.HTTP_200_OK)
+
+class ValidateDiscountView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @extend_schema(
+        request=DiscountValidationSerializer,
+        responses={
+            200: DiscountValidationResponseSerializer,
+            400: OpenApiResponse(description="Invalid or inapplicable discount code"),
+            404: OpenApiResponse(description="Bundle not found"),
+        },
+        description="Validate a discount code against a currently purchasable bundle.",
+    )
+    def post(self, request):
+        serializer = DiscountValidationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        course = get_object_or_404(
+            Course,
+            id=data["course_id"],
+            is_active=True,
+            bundle_type__in=Course.BundleType.values,
+        )
+        if not course.is_valid_bundle():
+            from django.http import Http404
+
+            raise Http404
+        final_price, discount = validate_and_apply_discount(course, data["code"])
+        payload = {
+            "valid": True,
+            "code": discount.code,
+            "original_price": course.price,
+            "final_price": final_price,
+        }
+        return Response(DiscountValidationResponseSerializer(payload).data)
