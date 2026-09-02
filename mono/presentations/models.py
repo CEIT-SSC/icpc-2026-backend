@@ -2,10 +2,10 @@
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
 from django.db.models import Q
-from django.db.models.signals import m2m_changed
+from django.db.models.signals import m2m_changed, post_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.text import slugify
@@ -430,6 +430,14 @@ class Registration(models.Model):
         validators=[MinValueValidator(0)],
         help_text="Price snapshot in Toman (IRT).",
     )
+    discount_code = models.ForeignKey(
+        "DiscountCode",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="registrations",
+        help_text="Discount reserved when this registration price was snapshotted.",
+    )
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.SUBMITTED)
 
     # optional resume link or blob pointer
@@ -666,18 +674,88 @@ def _is_full_by_count(course) -> bool:
 
 class DiscountCode(models.Model):
     code = models.CharField(max_length=32, unique=True)
-    percent_off = models.PositiveIntegerField(null=True, blank=True)  # the prcentage discount 
-    amount_off = models.PositiveIntegerField(null=True, blank=True)   # mizanesh
-    max_uses = models.PositiveIntegerField(null=True, blank=True)
+    percent_off = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(100)],
+    )
+    amount_off = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+    )
+    max_uses = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+    )
     used_count = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=True)
     valid_from = models.DateTimeField(null=True, blank=True)
     valid_until = models.DateTimeField(null=True, blank=True)
-    # اختیاری: محدود به یک دوره خاص
-    course = models.ForeignKey(Course, null=True, blank=True, on_delete=models.CASCADE, related_name="discount_codes")
+    course = models.ForeignKey(
+        Course,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="discount_codes",
+        help_text="Leave blank to allow this code on every current bundle.",
+    )
 
-    def is_valid(self):
-        now = timezone.now()
+    class Meta:
+        ordering = ["code"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(percent_off__isnull=False, amount_off__isnull=True)
+                    | models.Q(percent_off__isnull=True, amount_off__isnull=False)
+                ),
+                name="pres_discount_exactly_one_value",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(valid_from__isnull=True)
+                    | models.Q(valid_until__isnull=True)
+                    | models.Q(valid_until__gt=models.F("valid_from"))
+                ),
+                name="pres_discount_valid_window",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(max_uses__isnull=True)
+                    | models.Q(used_count__lte=models.F("max_uses"))
+                ),
+                name="pres_discount_usage_within_limit",
+            ),
+        ]
+
+    @staticmethod
+    def normalize_code(value: str) -> str:
+        return str(value or "").strip().upper()
+
+    def clean(self):
+        super().clean()
+        self.code = self.normalize_code(self.code)
+        errors = {}
+        if not self.code:
+            errors["code"] = "Enter a discount code."
+        if (self.percent_off is None) == (self.amount_off is None):
+            errors["percent_off"] = "Set exactly one of percent off or amount off."
+        if self.valid_from and self.valid_until and self.valid_until <= self.valid_from:
+            errors["valid_until"] = "Valid until must be later than valid from."
+        if self.max_uses is not None and self.used_count > self.max_uses:
+            errors["used_count"] = "Used count cannot exceed max uses."
+        if self.course_id and not self.course.is_bundle:
+            errors["course"] = "Course-specific discounts must target a bundle."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.code = self.normalize_code(self.code)
+        return super().save(*args, **kwargs)
+
+    def is_valid(self, *, now=None):
+        now = now or timezone.now()
         if not self.is_active:
             return False
         if self.valid_from and now < self.valid_from:
@@ -689,8 +767,21 @@ class DiscountCode(models.Model):
         return True
 
     def apply(self, price: int) -> int:
-        if self.percent_off:
+        if self.percent_off is not None:
             return max(0, price - (price * self.percent_off // 100))
-        if self.amount_off:
+        if self.amount_off is not None:
             return max(0, price - self.amount_off)
         return price
+
+    def __str__(self):
+        return self.code
+
+
+@receiver(post_delete, sender=Registration)
+def release_deleted_registration_discount(sender, instance, **kwargs):
+    """Keep reservation counters accurate when registrations are deleted."""
+    if instance.discount_code_id:
+        DiscountCode.objects.filter(
+            pk=instance.discount_code_id,
+            used_count__gt=0,
+        ).update(used_count=models.F("used_count") - 1)

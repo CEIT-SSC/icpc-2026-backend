@@ -300,6 +300,7 @@ def submit_registration(
     extra_updates: dict | None = None,
     child_ids: list[int] | None = None,
     resume_url: str | None = None,
+    discount_code: str | None = None,
 ) -> Registration:
     """Snapshot and allocate an indivisible current bundle, or waitlist it."""
     if (not user.is_authenticated) or not getattr(user, "is_email_verified", False):
@@ -386,7 +387,11 @@ def submit_registration(
     )
 
     reg.resume_url = resume_url or reg.resume_url
-    reg.price = course.price
+    reg.price, reg.discount_code = _reserve_discount_for_registration(
+        registration=reg,
+        course=course,
+        raw_code=discount_code,
+    )
     reg.submitted_at = timezone.now()
     reg.rejection_reason = ""
     reg.payment_link = ""
@@ -439,7 +444,7 @@ def _update_user_extra_data(*, user: User, extra_updates: dict) -> None:
 
 def _load_registration_for_lock(registration_id: int) -> Registration:
     return (
-        Registration.objects.select_related("course", "user")
+        Registration.objects.select_related("course", "user", "discount_code")
         .prefetch_related("items__child_course")
         .get(pk=registration_id)
     )
@@ -456,7 +461,7 @@ def set_status_approved(
     locked_courses = _lock_claimed_courses([tentative])
     reg = (
         Registration.objects.select_for_update()
-        .select_related("course", "user")
+        .select_related("course", "user", "discount_code")
         .prefetch_related("items__child_course")
         .get(pk=reg.pk)
     )
@@ -476,7 +481,7 @@ def set_status_approved(
 @transaction.atomic
 def initiate_registration_payment(*, registration_id: int, user: User):
     tentative = (
-        Registration.objects.select_related("course", "user")
+        Registration.objects.select_related("course", "user", "discount_code")
         .prefetch_related("items__child_course")
         .filter(id=registration_id, user=user)
         .first()
@@ -490,7 +495,7 @@ def initiate_registration_payment(*, registration_id: int, user: User):
     locked_courses = _lock_claimed_courses([tentative])
     reg = (
         Registration.objects.select_for_update()
-        .select_related("course", "user")
+        .select_related("course", "user", "discount_code")
         .prefetch_related("items__child_course")
         .get(id=registration_id, user=user)
     )
@@ -526,7 +531,11 @@ def initiate_registration_payment(*, registration_id: int, user: User):
         target_id=str(reg.id),
         amount=amount,
         description=_compose_description(reg),
-        extra_metadata={"reg_id": reg.id, "course_id": reg.course_id},
+        extra_metadata={
+            "reg_id": reg.id,
+            "course_id": reg.course_id,
+            "discount_code": reg.discount_code.code if reg.discount_code_id else None,
+        },
     )
     reg.payment_link = result.url
     reg.save(update_fields=["payment_link"])
@@ -804,21 +813,145 @@ def get_skyroom_presentation_link(
     return response.json().get("result", None)
 
 
-class InvalidDiscountCode(Exception):
-    pass
+class InvalidDiscountCode(CustomAPIException):
+    def __init__(self, *, error_code: int, message: str):
+        super().__init__(
+            code=error_code,
+            message=message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+def _get_discount_error(
+    discount: DiscountCode,
+    course: Course,
+    *,
+    owns_redemption: bool = False,
+) -> tuple[int, str] | None:
+    now = timezone.now()
+    if not discount.is_active:
+        return EC.DISCOUNT_INVALID, "This discount code is inactive."
+    if (discount.valid_from and now < discount.valid_from) or (
+        discount.valid_until and now > discount.valid_until
+    ):
+        return EC.DISCOUNT_EXPIRED, "This discount code is not currently valid."
+    if discount.course_id and discount.course_id != course.id:
+        return EC.DISCOUNT_NOT_APPLICABLE, "This code does not apply to this bundle."
+    if (
+        not owns_redemption
+        and discount.max_uses is not None
+        and discount.used_count >= discount.max_uses
+    ):
+        return EC.DISCOUNT_LIMIT_REACHED, "This discount code has reached its usage limit."
+    return None
+
+
+def _validate_discount_for_course(
+    discount: DiscountCode,
+    course: Course,
+    *,
+    owns_redemption: bool = False,
+    user: User | None = None,
+    registration_id: int | None = None,
+) -> int:
+    if not course.is_active or not course.is_bundle or course.price is None:
+        raise InvalidDiscountCode(
+            error_code=EC.DISCOUNT_NOT_APPLICABLE,
+            message="Discount codes can only be used for an active bundle.",
+        )
+    error = _get_discount_error(
+        discount,
+        course,
+        owns_redemption=owns_redemption,
+    )
+    if error:
+        error_code, message = error
+        raise InvalidDiscountCode(error_code=error_code, message=message)
+    if user is not None and not owns_redemption:
+        previous_use = Registration.objects.filter(
+            user=user,
+            discount_code=discount,
+        )
+        if registration_id is not None:
+            previous_use = previous_use.exclude(pk=registration_id)
+        if previous_use.exists():
+            raise InvalidDiscountCode(
+                error_code=EC.DISCOUNT_ALREADY_USED,
+                message="You have already used this discount code.",
+            )
+    return discount.apply(course.price)
+
+
+def _discount_id_for_code(raw_code: str) -> int | None:
+    code = DiscountCode.normalize_code(raw_code)
+    if not code:
+        return None
+    return (
+        DiscountCode.objects.filter(code__iexact=code)
+        .values_list("id", flat=True)
+        .first()
+    )
+
+
+def _reserve_discount_for_registration(
+    *,
+    registration: Registration,
+    course: Course,
+    raw_code: str | None,
+) -> tuple[int, DiscountCode | None]:
+    """Atomically replace a registration's discount reservation and snapshot price."""
+    requested_code = DiscountCode.normalize_code(raw_code)
+    requested_id = _discount_id_for_code(requested_code) if requested_code else None
+    if requested_code and requested_id is None:
+        raise InvalidDiscountCode(
+            error_code=EC.DISCOUNT_INVALID,
+            message="Discount code not found.",
+        )
+
+    previous_id = registration.discount_code_id
+    discount_ids = sorted({value for value in (previous_id, requested_id) if value})
+    locked_by_id = {
+        discount.id: discount
+        for discount in DiscountCode.objects.select_for_update()
+        .filter(id__in=discount_ids)
+        .order_by("id")
+    }
+    requested = locked_by_id.get(requested_id)
+    if requested_id and requested is None:
+        raise InvalidDiscountCode(
+            error_code=EC.DISCOUNT_INVALID,
+            message="Discount code not found.",
+        )
+
+    final_price = course.price
+    if requested is not None:
+        final_price = _validate_discount_for_course(
+            requested,
+            course,
+            owns_redemption=requested_id == previous_id,
+            user=registration.user,
+            registration_id=registration.id,
+        )
+
+    if previous_id != requested_id:
+        previous = locked_by_id.get(previous_id)
+        if previous is not None:
+            previous.used_count = max(previous.used_count - 1, 0)
+            previous.save(update_fields=["used_count"])
+        if requested is not None:
+            requested.used_count += 1
+            requested.save(update_fields=["used_count"])
+
+    return final_price, requested
 
 
 def validate_and_apply_discount(course: Course, code: str):
     """Return the discounted price and code, or raise InvalidDiscountCode."""
-    try:
-        discount = DiscountCode.objects.get(code=code)
-    except DiscountCode.DoesNotExist:
-        raise InvalidDiscountCode("کد تخفیف یافت نشد")
-
-    if not discount.is_valid():
-        raise InvalidDiscountCode("کد تخفیف منقضی یا غیرفعال است")
-
-    if discount.course and discount.course_id != course.id:
-        raise InvalidDiscountCode("این کد برای این دوره معتبر نیست")
-
-    return discount.apply(course.price), discount
+    normalized = DiscountCode.normalize_code(code)
+    discount = DiscountCode.objects.filter(code__iexact=normalized).first()
+    if discount is None:
+        raise InvalidDiscountCode(
+            error_code=EC.DISCOUNT_INVALID,
+            message="Discount code not found.",
+        )
+    return _validate_discount_for_course(discount, course), discount

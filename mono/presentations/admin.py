@@ -6,6 +6,7 @@ from .models import (
     BUNDLE_CATALOG,
     Course,
     CourseSession,
+    DiscountCode,
     Presenter,
     Registration,
     ScheduleRule,
@@ -106,6 +107,24 @@ class CourseSessionAdmin(admin.ModelAdmin):
     list_filter = ("course",)
 
 
+@admin.register(DiscountCode)
+class DiscountCodeAdmin(admin.ModelAdmin):
+    list_display = (
+        "code",
+        "course",
+        "percent_off",
+        "amount_off",
+        "used_count",
+        "max_uses",
+        "is_active",
+        "valid_from",
+        "valid_until",
+    )
+    list_filter = ("is_active", "course")
+    search_fields = ("code", "course__name", "course__slug")
+    readonly_fields = ("used_count",)
+
+
 
 @admin.register(Presenter)
 class PresenterAdmin(admin.ModelAdmin):
@@ -134,6 +153,7 @@ class RegistrationAdmin(admin.ModelAdmin):
         "member_snapshot",
         "effective_remaining_capacity",
         "decided_at",
+        "discount_code",
     )
     list_select_related = ("user", "course")
     list_filter = ("status", "course__bundle_type", "course")
@@ -158,6 +178,7 @@ class RegistrationAdmin(admin.ModelAdmin):
         "user_last_name",
         "user_phone",
         "price",
+        "discount_code",
         "submitted_at",
         "decided_at",
         "payment_link",
@@ -172,6 +193,7 @@ class RegistrationAdmin(admin.ModelAdmin):
                 "course",
                 "user",
                 "price",
+                "discount_code",
                 "member_snapshot",
                 "effective_remaining_capacity",
                 "status",

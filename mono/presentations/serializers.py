@@ -151,6 +151,12 @@ class RegistrationItemSerializer(serializers.ModelSerializer):
 
 class RegistrationCreateSerializer(serializers.Serializer):
     course_id = serializers.IntegerField()
+    discount_code = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=32,
+        trim_whitespace=True,
+    )
     extra_answers = serializers.DictField(
         child=serializers.JSONField(), required=False
     )
@@ -173,6 +179,11 @@ class RegistrationSerializer(serializers.ModelSerializer):
     items = RegistrationItemSerializer(many=True, read_only=True)
     total_amount = serializers.SerializerMethodField()
     waitlist_position = serializers.IntegerField(read_only=True)
+    discount_code = serializers.CharField(
+        source="discount_code.code",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = Registration
@@ -181,6 +192,7 @@ class RegistrationSerializer(serializers.ModelSerializer):
             "course",
             "user",
             "price",
+            "discount_code",
             "currency",
             "status",
             "waitlist_position",
@@ -195,6 +207,7 @@ class RegistrationSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "user",
             "price",
+            "discount_code",
             "currency",
             "status",
             "waitlist_position",
@@ -248,5 +261,13 @@ class CourseSessionSerializer(serializers.ModelSerializer):
 class CourseSessionResponseSerializer(serializers.Serializer):
     sessions = CourseSessionSerializer(many=True, read_only=True)
 
-class RegisterCourseSerializer(serializers.Serializer):
-    discount_code = serializers.CharField(required=False, allow_blank=True)
+class DiscountValidationSerializer(serializers.Serializer):
+    course_id = serializers.IntegerField()
+    code = serializers.CharField(max_length=32, trim_whitespace=True)
+
+
+class DiscountValidationResponseSerializer(serializers.Serializer):
+    valid = serializers.BooleanField()
+    code = serializers.CharField()
+    original_price = serializers.IntegerField()
+    final_price = serializers.IntegerField()

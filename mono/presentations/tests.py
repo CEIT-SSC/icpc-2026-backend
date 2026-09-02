@@ -1,5 +1,5 @@
 import importlib
-from datetime import time
+from datetime import time, timedelta
 from threading import Barrier, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +16,7 @@ from django.test import (
     TransactionTestCase,
     skipUnlessDBFeature,
 )
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from acm import error_codes as EC
@@ -27,6 +28,7 @@ from .models import (
     BUNDLE_CATALOG,
     Course,
     CourseSession,
+    DiscountCode,
     Registration,
     RegistrationItem,
     ScheduleRule,
@@ -311,6 +313,189 @@ class BundleRegistrationTests(BundleTestMixin, TestCase):
                 user=self.make_user("unverified", verified=False),
             )
         self.assertEqual(raised.exception.app_code, EC.ACC_EMAIL_NOT_VERIFIED)
+
+
+class DiscountCodeTests(BundleTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.bundle, self.members = self.make_bundle(capacities=[2] * 6)
+        self.user = self.make_user("discount")
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def test_registration_reserves_discount_and_payment_uses_snapshot(self):
+        discount = DiscountCode.objects.create(
+            code="launch25",
+            percent_off=25,
+            max_uses=2,
+        )
+
+        response = self.client.post(
+            "/api/presentations/register/",
+            {"course_id": self.bundle.id, "discount_code": " launch25 "},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["discount_code"], "LAUNCH25")
+        self.assertEqual(response.data["price"], 449_250)
+        self.assertEqual(response.data["total_amount"], 449_250)
+        discount.refresh_from_db()
+        self.assertEqual(discount.used_count, 1)
+
+        reg = Registration.objects.get(pk=response.data["id"])
+        with patch(
+            "presentations.services.initiate_payment_for_target",
+            return_value=gateway_result(449_250),
+        ) as initiate:
+            initiate_registration_payment(registration_id=reg.id, user=self.user)
+        self.assertEqual(initiate.call_args.kwargs["amount"], 449_250)
+        self.assertEqual(
+            initiate.call_args.kwargs["extra_metadata"]["discount_code"],
+            "LAUNCH25",
+        )
+
+    def test_zero_price_discount_finalizes_without_payment(self):
+        discount = DiscountCode.objects.create(code="free", amount_off=1_000_000)
+
+        reg = submit_registration(
+            course=self.bundle,
+            user=self.user,
+            discount_code=discount.code,
+        )
+
+        self.assertEqual(reg.price, 0)
+        self.assertEqual(reg.status, Registration.Status.FINAL)
+        with self.assertRaises(CustomAPIException) as raised:
+            initiate_registration_payment(registration_id=reg.id, user=self.user)
+        self.assertEqual(raised.exception.app_code, EC.REG_PAYMENT_NOT_AVAILABLE)
+
+    def test_waitlist_retry_preserves_snapshot_without_double_redemption(self):
+        for member in self.members:
+            Course.objects.filter(pk=member.pk).update(capacity=0)
+        discount = DiscountCode.objects.create(code="wait", amount_off=99_000)
+
+        first = submit_registration(
+            course=self.bundle,
+            user=self.user,
+            discount_code="WAIT",
+        )
+        second = submit_registration(
+            course=self.bundle,
+            user=self.user,
+            discount_code="WAIT",
+        )
+
+        discount.refresh_from_db()
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(first.price, 500_000)
+        self.assertEqual(discount.used_count, 1)
+
+    def test_usage_limit_and_per_user_reuse_are_rejected(self):
+        discount = DiscountCode.objects.create(
+            code="once",
+            amount_off=10_000,
+            max_uses=2,
+        )
+        submit_registration(
+            course=self.bundle,
+            user=self.user,
+            discount_code=discount.code,
+        )
+        other_bundle, _ = self.make_bundle(
+            Course.BundleType.ALL_ONLINE_WORKSHOPS,
+        )
+
+        with self.assertRaises(CustomAPIException) as reused:
+            submit_registration(
+                course=other_bundle,
+                user=self.user,
+                discount_code=discount.code,
+            )
+        self.assertEqual(reused.exception.app_code, EC.DISCOUNT_ALREADY_USED)
+
+        submit_registration(
+            course=other_bundle,
+            user=self.make_user("discount-second"),
+            discount_code=discount.code,
+        )
+        with self.assertRaises(CustomAPIException) as exhausted:
+            submit_registration(
+                course=other_bundle,
+                user=self.make_user("discount-third"),
+                discount_code=discount.code,
+            )
+        self.assertEqual(exhausted.exception.app_code, EC.DISCOUNT_LIMIT_REACHED)
+
+    def test_validation_endpoint_does_not_consume_code(self):
+        discount = DiscountCode.objects.create(
+            code="preview",
+            percent_off=10,
+            valid_from=timezone.now() - timedelta(hours=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+        )
+
+        response = self.client.post(
+            "/api/presentations/discount/validate/",
+            {"course_id": self.bundle.id, "code": "preview"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["code"], "PREVIEW")
+        self.assertEqual(response.data["original_price"], 599_000)
+        self.assertEqual(response.data["final_price"], 539_100)
+        discount.refresh_from_db()
+        self.assertEqual(discount.used_count, 0)
+
+    def test_expired_and_wrong_bundle_codes_return_standard_errors(self):
+        expired = DiscountCode.objects.create(
+            code="expired",
+            amount_off=10,
+            valid_until=timezone.now() - timedelta(seconds=1),
+        )
+        wrong_bundle, _ = self.make_bundle(
+            Course.BundleType.ALL_IN_PERSON_WORKSHOPS,
+        )
+        targeted = DiscountCode.objects.create(
+            code="targeted",
+            amount_off=10,
+            course=wrong_bundle,
+        )
+
+        for code, expected_error in (
+            (expired.code, EC.DISCOUNT_EXPIRED),
+            (targeted.code, EC.DISCOUNT_NOT_APPLICABLE),
+        ):
+            response = self.client.post(
+                "/api/presentations/discount/validate/",
+                {"course_id": self.bundle.id, "code": code},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.data["errorCode"], expected_error)
+
+    def test_model_rejects_ambiguous_discount_value(self):
+        discount = DiscountCode(
+            code="ambiguous",
+            percent_off=10,
+            amount_off=10,
+        )
+        with self.assertRaises(ValidationError):
+            discount.full_clean()
+
+    def test_deleting_registration_releases_discount_reservation(self):
+        discount = DiscountCode.objects.create(code="released", amount_off=10)
+        registration = submit_registration(
+            course=self.bundle,
+            user=self.user,
+            discount_code=discount.code,
+        )
+
+        registration.delete()
+
+        discount.refresh_from_db()
+        self.assertEqual(discount.used_count, 0)
 
 
 class BundleCapacityAndPromotionTests(BundleTestMixin, TestCase):
@@ -810,6 +995,53 @@ class BundleAdminAndValidationTests(BundleTestMixin, TestCase):
 @skipUnlessDBFeature("has_select_for_update")
 class BundleConcurrencyTests(BundleTestMixin, TransactionTestCase):
     reset_sequences = True
+
+    def test_concurrent_redemptions_cannot_exceed_global_limit(self):
+        bundles = [
+            self.make_bundle(Course.BundleType.ALL_ONLINE_PRESENTATIONS)[0],
+            self.make_bundle(Course.BundleType.ALL_ONLINE_WORKSHOPS)[0],
+        ]
+        users = [self.make_user(f"discount-race-{index}") for index in range(2)]
+        discount = DiscountCode.objects.create(
+            code="race",
+            amount_off=10_000,
+            max_uses=1,
+        )
+        barrier = Barrier(2)
+        result_lock = Lock()
+        results = []
+
+        def register(course_id, user_id):
+            close_old_connections()
+            try:
+                barrier.wait()
+                registration = submit_registration(
+                    course=Course.objects.get(pk=course_id),
+                    user=get_user_model().objects.get(pk=user_id),
+                    discount_code=discount.code,
+                )
+                value = registration.status
+            except CustomAPIException as exc:
+                value = exc.app_code
+            finally:
+                close_old_connections()
+            with result_lock:
+                results.append(value)
+
+        threads = [
+            Thread(target=register, args=(bundle.id, user.id))
+            for bundle, user in zip(bundles, users)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results.count(Registration.Status.APPROVED), 1)
+        self.assertEqual(results.count(EC.DISCOUNT_LIMIT_REACHED), 1)
+        discount.refresh_from_db()
+        self.assertEqual(discount.used_count, 1)
 
     def test_concurrent_bundle_submissions_do_not_oversell_any_member(self):
         bundle, members = self.make_bundle(

@@ -25,6 +25,5 @@ urlpatterns = [
         RegistrationPaymentView.as_view(),
     ),
     path("participation/link/", SkyroomLinkView.as_view()),
-    path("discount/validate/", ValidateDiscountView.as_view())
+    path("discount/validate/", ValidateDiscountView.as_view()),
 ]
-
