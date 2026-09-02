@@ -1,23 +1,12 @@
-"""Purchasable ICPC 2026 offerings and their registrations.
-
-The current catalogue has four individual offering types: online presentations
-(250 seats, 85,000 Toman), offline presentations (unlimited, 60,000 Toman),
-in-person workshops (125 seats, 125,000 Toman), and online workshops (80 seats,
-85,000 Toman). The price and capacity are stored on each ``Course`` so the
-database remains the source of truth; the type-specific values are applied as
-creation defaults.
-
-Full packages are intentionally not offered in this release. The legacy
-``children`` relationship and ``RegistrationItem`` rows remain only to preserve
-last year's data and access. If packages return, they must not have their own
-capacity: finalizing one purchase must atomically claim every finite child seat.
-"""
+"""ICPC 2026 bundle catalogue and preservation-safe registration history."""
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import Q
+from django.db.models.signals import m2m_changed
+from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -51,6 +40,42 @@ OFFERING_DEFAULTS = {
     },
 }
 
+BUNDLE_CATALOG = {
+    "ALL_ONLINE_PRESENTATIONS": {
+        "name": "All online presentations",
+        "slug": "online-presentations-bundle",
+        "price": 599_000,
+        "offering_type": "ONLINE_PRESENTATION",
+        "expected_member_count": 6,
+        "category": "PRESENTATION",
+        "delivery_mode": "ONLINE",
+        "online": True,
+        "onsite": False,
+    },
+    "ALL_IN_PERSON_WORKSHOPS": {
+        "name": "All in-person workshops",
+        "slug": "in-person-workshops-bundle",
+        "price": 419_000,
+        "offering_type": "IN_PERSON_WORKSHOP",
+        "expected_member_count": 3,
+        "category": "WORKSHOP",
+        "delivery_mode": "IN_PERSON",
+        "online": False,
+        "onsite": True,
+    },
+    "ALL_ONLINE_WORKSHOPS": {
+        "name": "All online workshops",
+        "slug": "online-workshops-bundle",
+        "price": 299_000,
+        "offering_type": "ONLINE_WORKSHOP",
+        "expected_member_count": 3,
+        "category": "WORKSHOP",
+        "delivery_mode": "ONLINE",
+        "online": True,
+        "onsite": False,
+    },
+}
+
 
 
 
@@ -74,6 +99,20 @@ class Course(models.Model):
         IN_PERSON_WORKSHOP = "IN_PERSON_WORKSHOP", "In-person workshop"
         ONLINE_WORKSHOP = "ONLINE_WORKSHOP", "Online workshop"
 
+    class BundleType(models.TextChoices):
+        ALL_ONLINE_PRESENTATIONS = (
+            "ALL_ONLINE_PRESENTATIONS",
+            "All online presentations",
+        )
+        ALL_IN_PERSON_WORKSHOPS = (
+            "ALL_IN_PERSON_WORKSHOPS",
+            "All in-person workshops",
+        )
+        ALL_ONLINE_WORKSHOPS = (
+            "ALL_ONLINE_WORKSHOPS",
+            "All online workshops",
+        )
+
     name = models.CharField(max_length=200)
     subtitle = models.CharField(max_length=200, blank=True)
     description = models.TextField(blank=True)
@@ -91,6 +130,14 @@ class Course(models.Model):
         blank=True,
         db_index=True,
         help_text="Blank values are retained only for legacy offerings.",
+    )
+    bundle_type = models.CharField(
+        max_length=32,
+        choices=BundleType.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable product type for current all-access bundle parents.",
     )
     capacity = models.PositiveIntegerField(
         null=True,
@@ -110,7 +157,10 @@ class Course(models.Model):
         symmetrical=False,
         related_name="parents",
         blank=True,
-        help_text="Legacy bundle composition; new package purchases are disabled.",
+        help_text=(
+            "Current bundle composition. RegistrationItem preserves the purchased "
+            "composition historically."
+        ),
     )
 
     requires_approval = models.BooleanField(
@@ -125,19 +175,37 @@ class Course(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def apply_offering_defaults(self) -> None:
+        if self.bundle_type:
+            return
         defaults = OFFERING_DEFAULTS.get(self.offering_type)
         if not defaults:
             return
         self.online = defaults["online"]
         self.onsite = defaults["onsite"]
-        if self.price is None:
+        if self.price is None and self._state.adding:
             self.price = defaults["price"]
         if self.offering_type == self.OfferingType.OFFLINE_PRESENTATION:
             self.capacity = None
-        elif self.capacity is None:
+        elif self.capacity is None and self._state.adding:
             self.capacity = defaults["capacity"]
 
     def save(self, *args, **kwargs):
+        if self.bundle_type in BUNDLE_CATALOG:
+            config = BUNDLE_CATALOG[self.bundle_type]
+            self.offering_type = None
+            self.capacity = None
+            self.online = config["online"]
+            self.onsite = config["onsite"]
+            if not self.slug:
+                self.slug = config["slug"]
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = set(kwargs["update_fields"]) | {
+                    "offering_type",
+                    "capacity",
+                    "online",
+                    "onsite",
+                    "slug",
+                }
         self.apply_offering_defaults()
         if not self.slug:
             self.slug = slugify(self.name)[:220]
@@ -172,17 +240,146 @@ class Course(models.Model):
                 def promote_after_capacity_change():
                     from .tasks import promote_waitlist_task
 
-                    promote_waitlist_task.delay(course_id)
+                    promote_waitlist_task.delay([course_id])
 
                 transaction.on_commit(promote_after_capacity_change, robust=True)
             return result
 
+    def clean(self):
+        super().clean()
+        if self.bundle_type:
+            errors = {}
+            config = BUNDLE_CATALOG.get(self.bundle_type)
+            if not config:
+                errors["bundle_type"] = "Unknown bundle type."
+            if self.offering_type is not None:
+                errors["offering_type"] = (
+                    "A typed bundle parent cannot also be a component offering."
+                )
+            if self.capacity is not None:
+                errors["capacity"] = (
+                    "Bundle capacity is derived from members and must be blank."
+                )
+            if self.price is None:
+                errors["price"] = "A typed bundle must have a bundle price."
+            if config and self.slug and self.slug != config["slug"]:
+                errors["slug"] = "Typed bundles must use their stable catalogue slug."
+            if errors:
+                raise ValidationError(errors)
+
+    @property
+    def is_bundle(self) -> bool:
+        return self.bundle_type in Course.BundleType.values
+
+    @property
+    def category(self) -> str | None:
+        if self.is_bundle:
+            return BUNDLE_CATALOG[self.bundle_type]["category"]
+        if self.offering_type in (
+            self.OfferingType.ONLINE_PRESENTATION,
+            self.OfferingType.OFFLINE_PRESENTATION,
+        ):
+            return "PRESENTATION"
+        if self.offering_type in (
+            self.OfferingType.IN_PERSON_WORKSHOP,
+            self.OfferingType.ONLINE_WORKSHOP,
+        ):
+            return "WORKSHOP"
+        return None
+
+    @property
+    def delivery_mode(self) -> str | None:
+        if self.is_bundle:
+            return BUNDLE_CATALOG[self.bundle_type]["delivery_mode"]
+        if self.offering_type in (
+            self.OfferingType.ONLINE_PRESENTATION,
+            self.OfferingType.ONLINE_WORKSHOP,
+        ):
+            return "ONLINE"
+        if self.offering_type == self.OfferingType.IN_PERSON_WORKSHOP:
+            return "IN_PERSON"
+        return None
+
+    def bundle_members(self):
+        cached = getattr(self, "_prefetched_objects_cache", {}).get("children")
+        if cached is not None:
+            return sorted(cached, key=lambda member: member.id)
+        return self.children.all().order_by("id")
+
+    def bundle_composition_errors(self, members=None) -> list[str]:
+        """Return current-bundle errors without mutating legacy relationships."""
+        if not self.is_bundle:
+            return ["Course is not a typed bundle."]
+        config = BUNDLE_CATALOG[self.bundle_type]
+        members = list(self.bundle_members() if members is None else members)
+        errors = []
+        if len(members) != config["expected_member_count"]:
+            errors.append(
+                f"{self.get_bundle_type_display()} requires exactly "
+                f"{config['expected_member_count']} members."
+            )
+        expected_type = config["offering_type"]
+        invalid = [
+            member
+            for member in members
+            if member.bundle_type
+            or member.offering_type != expected_type
+            or not member.is_active
+        ]
+        if invalid:
+            errors.append(
+                "Every member must be an active component with offering type "
+                f"{expected_type}."
+            )
+        for member in members:
+            other_parents = [
+                parent
+                for parent in member.parents.all()
+                if parent.pk != self.pk and parent.is_active and parent.is_bundle
+            ]
+            if other_parents:
+                errors.append(
+                    f"{member.name} already belongs to another active typed bundle."
+                )
+                break
+        return errors
+
+    def is_valid_bundle(self) -> bool:
+        if (
+            not self.is_bundle
+            or not self.is_active
+            or self.offering_type is not None
+            or self.capacity is not None
+            or self.price is None
+            or self.slug != BUNDLE_CATALOG[self.bundle_type]["slug"]
+        ):
+            return False
+        return not self.bundle_composition_errors()
+
+    def effective_capacity(self) -> int | None:
+        if not self.is_bundle:
+            return self.capacity
+        members = list(self.bundle_members())
+        finite = [member.capacity for member in members if member.capacity is not None]
+        return min(finite) if finite else None
+
     @property
     def is_unlimited(self) -> bool:
+        if self.is_bundle:
+            members = list(self.bundle_members())
+            return bool(members) and all(member.capacity is None for member in members)
         return self.capacity is None
 
     def remained_capacity(self) -> int | None:
-        """Remaining seats considering both direct and child purchases."""
+        """Return a component's seats or a bundle's all-members bottleneck."""
+        if self.is_bundle:
+            members = list(self.bundle_members())
+            finite_remaining = [
+                member.remained_capacity()
+                for member in members
+                if member.capacity is not None
+            ]
+            return min(finite_remaining) if finite_remaining else None
         if self.is_unlimited:
             return None
         used = _taken_seats(self)
@@ -225,7 +422,7 @@ class Registration(models.Model):
         REJECTED = "REJECTED", "Rejected"
         CANCELLED = "CANCELLED", "Cancelled"
 
-    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name="registrations")
+    course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name="registrations")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="course_registrations")
     price = models.PositiveIntegerField(
         null=True,
@@ -264,6 +461,9 @@ class Registration(models.Model):
         """Return the current one-based FIFO position for a waitlisted user."""
         if self.status != self.Status.RESERVED or not self.pk:
             return None
+        snapshot = getattr(self, "_waitlist_position_snapshot", None)
+        if snapshot is not None:
+            return snapshot
         earlier = Registration.objects.filter(
             course_id=self.course_id,
             status=self.Status.RESERVED,
@@ -311,8 +511,11 @@ COUNT_STATUSES = (Registration.Status.APPROVED, Registration.Status.FINAL)
 def _taken_seats(
     course, *, exclude_registration_ids=None, for_update: bool = False
 ) -> int:
-    """How many seats of `course` are occupied in COUNT_STATUSES,
-    counting both direct (parent) and child purchases."""
+    """Count distinct participants across direct and snapshotted claims."""
+    if not exclude_registration_ids and not for_update:
+        snapshot = getattr(course, "_taken_seats_snapshot", None)
+        if snapshot is not None:
+            return snapshot
     direct_qs = Registration.objects.filter(
         course=course,
         status__in=COUNT_STATUSES,
@@ -327,14 +530,129 @@ def _taken_seats(
     if for_update:
         # A locking read is a current read on MySQL. This avoids an older
         # REPEATABLE READ snapshot after waiting for the course lock.
-        direct = len(
-            list(direct_qs.select_for_update().values_list("id", flat=True))
+        direct_users = set(
+            direct_qs.select_for_update().values_list("user_id", flat=True)
         )
-        children = len(
-            list(child_qs.select_for_update().values_list("id", flat=True))
+        child_users = set(
+            child_qs.select_for_update().values_list(
+                "registration__user_id", flat=True
+            )
         )
-        return direct + children
-    return direct_qs.count() + child_qs.count()
+        return len(direct_users | child_users)
+    direct_users = set(direct_qs.values_list("user_id", flat=True))
+    child_users = set(
+        child_qs.values_list("registration__user_id", flat=True)
+    )
+    return len(direct_users | child_users)
+
+
+def attach_capacity_snapshots(courses) -> None:
+    """Attach bulk participant counts to courses used by public serializers."""
+    roots = list(courses)
+    by_id = {course.id: course for course in roots}
+    for course in roots:
+        if course.is_bundle:
+            for member in course.bundle_members():
+                by_id[member.id] = member
+    ids = list(by_id)
+    participants = {course_id: set() for course_id in ids}
+    for course_id, user_id in Registration.objects.filter(
+        course_id__in=ids,
+        status__in=COUNT_STATUSES,
+    ).values_list("course_id", "user_id"):
+        participants[course_id].add(user_id)
+    for course_id, user_id in RegistrationItem.objects.filter(
+        child_course_id__in=ids,
+        registration__status__in=COUNT_STATUSES,
+    ).values_list("child_course_id", "registration__user_id"):
+        participants[course_id].add(user_id)
+    for course_id, course in by_id.items():
+        course._taken_seats_snapshot = len(participants[course_id])
+
+
+@receiver(m2m_changed, sender=Course.children.through)
+def validate_typed_bundle_member_addition(
+    sender, instance, action, reverse, model, pk_set, **kwargs
+):
+    """Block invalid/overlapping additions while ignoring legacy relationships."""
+    if action in ("pre_remove", "pre_clear"):
+        if reverse:
+            parent_ids = set(pk_set or instance.parents.values_list("id", flat=True))
+            lock_ids = {instance.pk, *parent_ids}
+        elif instance.is_bundle:
+            member_ids = set(pk_set or instance.children.values_list("id", flat=True))
+            lock_ids = {instance.pk, *member_ids}
+        else:
+            return
+        list(
+            Course.objects.select_for_update()
+            .filter(pk__in=sorted(lock_ids))
+            .order_by("id")
+        )
+        return
+    if action != "pre_add" or not pk_set:
+        return
+    if reverse:
+        list(
+            Course.objects.select_for_update()
+            .filter(pk__in=sorted({instance.pk, *pk_set}))
+            .order_by("id")
+        )
+        parents = list(
+            Course.objects.filter(
+                pk__in=pk_set,
+                is_active=True,
+                bundle_type__isnull=False,
+            )
+        )
+        if not parents:
+            return
+        if any(
+            instance.bundle_type
+            or instance.offering_type
+            != BUNDLE_CATALOG[parent.bundle_type]["offering_type"]
+            or not instance.is_active
+            for parent in parents
+        ):
+            raise ValidationError(
+                "Typed bundles may contain only active components of their configured type."
+            )
+        existing = instance.parents.filter(
+            is_active=True,
+            bundle_type__isnull=False,
+        ).exclude(pk__in=pk_set)
+        if existing.exists() or len(parents) > 1:
+            raise ValidationError(
+                "A component cannot belong to more than one active typed bundle."
+            )
+        return
+    if not instance.is_bundle:
+        return
+    config = BUNDLE_CATALOG[instance.bundle_type]
+    locked = list(
+        Course.objects.select_for_update()
+        .filter(pk__in=sorted({instance.pk, *pk_set}))
+        .order_by("id")
+    )
+    members = [course for course in locked if course.pk in pk_set]
+    if len(members) != len(pk_set) or any(
+        member.bundle_type
+        or member.offering_type != config["offering_type"]
+        or not member.is_active
+        for member in members
+    ):
+        raise ValidationError(
+            "Typed bundles may contain only active components of their configured type."
+        )
+    overlapping = Course.objects.filter(
+        children__id__in=pk_set,
+        is_active=True,
+        bundle_type__isnull=False,
+    ).exclude(pk=instance.pk)
+    if overlapping.exists():
+        raise ValidationError(
+            "A component cannot belong to more than one active typed bundle."
+        )
 
 def _is_full_by_count(course) -> bool:
     """True if course capacity is exhausted according to COUNT_STATUSES."""

@@ -1,7 +1,16 @@
-from rest_framework import serializers
+from rest_framework import serializers, status
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from .models import Course, Presenter, ScheduleRule, Registration, RegistrationItem, CourseSession
+from .models import (
+    Course,
+    CourseSession,
+    Presenter,
+    Registration,
+    RegistrationItem,
+    ScheduleRule,
+)
+from acm import error_codes as EC
+from acm.exceptions import CustomAPIException
 
 User = get_user_model()
 
@@ -21,19 +30,28 @@ class ScheduleRuleSerializer(serializers.ModelSerializer):
 
 
 class ChildCourseSerializer(serializers.ModelSerializer):
+    presenters = PresenterSerializer(many=True, read_only=True)
     schedule = ScheduleRuleSerializer(many=True, read_only=True)
     offering_type_display = serializers.CharField(
         source="get_offering_type_display", read_only=True
     )
     currency = serializers.SerializerMethodField()
+    capacity = serializers.SerializerMethodField()
+    remained_capacity = serializers.SerializerMethodField()
+    is_unlimited = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Course
         fields = (
             "id",
             "name",
+            "subtitle",
+            "description",
+            "presenters",
             "offering_type",
             "offering_type_display",
+            "online",
+            "onsite",
             "capacity",
             "remained_capacity",
             "is_unlimited",
@@ -47,6 +65,12 @@ class ChildCourseSerializer(serializers.ModelSerializer):
     def get_currency(self, obj: Course) -> str:
         return settings.PAYMENT_CURRENCY
 
+    def get_capacity(self, obj: Course) -> int | None:
+        return obj.effective_capacity()
+
+    def get_remained_capacity(self, obj: Course) -> int | None:
+        return obj.remained_capacity()
+
 
 class CourseSerializer(serializers.ModelSerializer):
     presenters = PresenterSerializer(many=True, read_only=True)
@@ -54,8 +78,18 @@ class CourseSerializer(serializers.ModelSerializer):
     offering_type_display = serializers.CharField(
         source="get_offering_type_display", read_only=True
     )
+    bundle_type_display = serializers.CharField(
+        source="get_bundle_type_display", read_only=True, allow_null=True
+    )
     currency = serializers.SerializerMethodField()
     requires_approval = serializers.SerializerMethodField()
+    capacity = serializers.SerializerMethodField()
+    remained_capacity = serializers.SerializerMethodField()
+    is_unlimited = serializers.BooleanField(read_only=True)
+    category = serializers.CharField(read_only=True, allow_null=True)
+    delivery_mode = serializers.CharField(read_only=True, allow_null=True)
+    member_count = serializers.SerializerMethodField()
+    members = ChildCourseSerializer(source="children", many=True, read_only=True)
 
     class Meta:
         model = Course
@@ -69,6 +103,10 @@ class CourseSerializer(serializers.ModelSerializer):
             "online",
             "onsite",
             "classes_count",
+            "bundle_type",
+            "bundle_type_display",
+            "category",
+            "delivery_mode",
             "offering_type",
             "offering_type_display",
             "capacity",
@@ -79,6 +117,8 @@ class CourseSerializer(serializers.ModelSerializer):
             "requires_approval",
             "slug",
             "is_active",
+            "member_count",
+            "members",
             "schedule",
         )
 
@@ -88,6 +128,17 @@ class CourseSerializer(serializers.ModelSerializer):
     def get_requires_approval(self, obj: Course) -> bool:
         # Kept in the response for compatibility; manual approval is retired.
         return False
+
+    def get_capacity(self, obj: Course) -> int | None:
+        return obj.effective_capacity()
+
+    def get_remained_capacity(self, obj: Course) -> int | None:
+        return obj.remained_capacity()
+
+    def get_member_count(self, obj: Course) -> int:
+        if not obj.is_bundle:
+            return 0
+        return len(obj.children.all())
 
 
 class RegistrationItemSerializer(serializers.ModelSerializer):
@@ -106,13 +157,13 @@ class RegistrationCreateSerializer(serializers.Serializer):
 
     def to_internal_value(self, data):
         if "child_ids" in data:
-            raise serializers.ValidationError(
-                {
-                    "child_ids": (
-                        "Packages are not available; register for one offering "
-                        "using course_id only."
-                    )
-                }
+            raise CustomAPIException(
+                code=EC.REG_PACKAGE_UNAVAILABLE,
+                message=(
+                    "Do not send child_ids; the server selects every bundle "
+                    "member from course_id."
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
             )
         return super().to_internal_value(data)
 

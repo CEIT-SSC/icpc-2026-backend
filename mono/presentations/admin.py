@@ -1,7 +1,15 @@
+from django import forms
 from django.contrib import admin
-from django.utils import timezone
+from django.core.exceptions import ValidationError
 
-from .models import Course, Presenter, ScheduleRule, Registration, CourseSession
+from .models import (
+    BUNDLE_CATALOG,
+    Course,
+    CourseSession,
+    Presenter,
+    Registration,
+    ScheduleRule,
+)
 from .services import set_status_approved, set_status_rejected, set_status_final
 
 
@@ -12,29 +20,83 @@ class ScheduleInline(admin.TabularInline):
     extra = 0
 
 
+class CourseAdminForm(forms.ModelForm):
+    class Meta:
+        model = Course
+        fields = "__all__"
+
+    def clean(self):
+        cleaned = super().clean()
+        bundle_type = cleaned.get("bundle_type")
+        if not bundle_type:
+            return cleaned
+        members = list(cleaned.get("children") or [])
+        config = BUNDLE_CATALOG[bundle_type]
+        errors = []
+        if len(members) != config["expected_member_count"]:
+            errors.append(
+                f"Select exactly {config['expected_member_count']} bundle members."
+            )
+        if any(
+            member.bundle_type
+            or member.offering_type != config["offering_type"]
+            or not member.is_active
+            for member in members
+        ):
+            errors.append(
+                "Members must be active component courses of the configured offering type."
+            )
+        overlapping = Course.objects.filter(
+            children__in=members,
+            is_active=True,
+            bundle_type__isnull=False,
+        )
+        if self.instance.pk:
+            overlapping = overlapping.exclude(pk=self.instance.pk)
+        if overlapping.exists():
+            errors.append(
+                "A selected component already belongs to another active typed bundle."
+            )
+        if errors:
+            raise ValidationError({"children": errors})
+        return cleaned
+
+
 
 
 @admin.register(Course)
 class CourseAdmin(admin.ModelAdmin):
+    form = CourseAdminForm
     list_display = (
         "name",
+        "bundle_type",
         "offering_type",
-        "capacity",
+        "effective_capacity_display",
         "remaining_capacity",
         "price",
         "is_active",
     )
-    list_filter = ("offering_type", "is_active")
-    search_fields = ("name", "subtitle")
+    list_filter = ("bundle_type", "offering_type", "is_active")
+    search_fields = ("name", "subtitle", "slug")
     inlines = [ScheduleInline]
-    filter_horizontal = ("presenters",)
-    exclude = ("children",)
+    filter_horizontal = ("presenters", "children")
     readonly_fields = ("online", "onsite", "requires_approval")
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj and obj.is_bundle:
+            fields.append("capacity")
+        return tuple(fields)
 
     @admin.display(description="Remaining capacity")
     def remaining_capacity(self, obj: Course):
         remaining = obj.remained_capacity()
         return "Unlimited" if remaining is None else remaining
+
+    @admin.display(description="Effective capacity")
+    def effective_capacity_display(self, obj: Course):
+        capacity = obj.effective_capacity()
+        return "Unlimited" if capacity is None else capacity
 
 
 @admin.register(CourseSession)
@@ -62,16 +124,19 @@ class RegistrationAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "course",
+        "bundle_type",
         "user_email",
         "user_full_name",
         "user_phone",
         "price",
         "status",
         "submitted_at",
+        "member_snapshot",
+        "effective_remaining_capacity",
         "decided_at",
     )
     list_select_related = ("user", "course")
-    list_filter = ("status", "course")
+    list_filter = ("status", "course__bundle_type", "course")
     search_fields = (
         "course__name",
         "course__slug",
@@ -96,6 +161,8 @@ class RegistrationAdmin(admin.ModelAdmin):
         "submitted_at",
         "decided_at",
         "payment_link",
+        "member_snapshot",
+        "effective_remaining_capacity",
     )
 
     
@@ -105,6 +172,8 @@ class RegistrationAdmin(admin.ModelAdmin):
                 "course",
                 "user",
                 "price",
+                "member_snapshot",
+                "effective_remaining_capacity",
                 "status",
                 "payment_link",
                 "rejection_reason",
@@ -125,6 +194,25 @@ class RegistrationAdmin(admin.ModelAdmin):
 
     
     actions = ("approve_selected", "reject_selected", "finalize_selected")
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("course", "user").prefetch_related(
+            "items__child_course", "course__children"
+        )
+
+    @admin.display(ordering="course__bundle_type", description="Bundle type")
+    def bundle_type(self, obj: Registration) -> str:
+        return obj.course.bundle_type or "Legacy / individual"
+
+    @admin.display(description="Member snapshot")
+    def member_snapshot(self, obj: Registration) -> str:
+        names = [item.child_course.name for item in obj.items.all()]
+        return ", ".join(names) if names else "—"
+
+    @admin.display(description="Effective remaining capacity")
+    def effective_remaining_capacity(self, obj: Registration):
+        remaining = obj.course.remained_capacity()
+        return "Unlimited" if remaining is None else remaining
 
     
 
