@@ -252,14 +252,19 @@ class SkyroomLinkGeneratorResponseSerializer(serializers.Serializer):
     class Meta:
         fields = ("link",)
 
+
 class CourseSessionSerializer(serializers.ModelSerializer):
     class Meta:
         model = CourseSession
-        fields = "__all__"
+        fields = (
+            "id",
+            "course",
+            "title",
+            "subtitle",
+            "description",
+            "recording_link",
+        )
 
-
-class CourseSessionResponseSerializer(serializers.Serializer):
-    sessions = CourseSessionSerializer(many=True, read_only=True)
 
 class DiscountValidationSerializer(serializers.Serializer):
     course_id = serializers.IntegerField()

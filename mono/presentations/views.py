@@ -9,13 +9,15 @@ from rest_framework.views import APIView
 
 from .models import Course, CourseSession, Registration, attach_capacity_snapshots
 from .serializers import (
+    CourseSessionSerializer,
     CourseSerializer,
     DiscountValidationResponseSerializer,
     DiscountValidationSerializer,
     RegistrationCreateSerializer,
     RegistrationPaymentSerializer,
-    RegistrationSerializer, SkyroomLinkGeneratorSerializer, SkyroomLinkGeneratorResponseSerializer,
-    CourseSessionSerializer, CourseSessionResponseSerializer,
+    RegistrationSerializer,
+    SkyroomLinkGeneratorResponseSerializer,
+    SkyroomLinkGeneratorSerializer,
 )
 from .services import (
     create_skyroom_link,
@@ -277,15 +279,22 @@ class CourseSessionsView(generics.ListAPIView):
     serializer_class = CourseSessionSerializer
 
     @extend_schema(
-        responses={200: CourseSessionResponseSerializer(many=True)},
-        description="List the authenticated user's course sessions."
+        responses={200: CourseSessionSerializer(many=True)},
+        description="List the authenticated user's course sessions.",
     )
     def get(self, request, slug):
         course = get_object_or_404(Course, slug=slug, is_active=True)
         current_sessions = get_course_sessions(request.user, course)
         if current_sessions is None:
-            return Response(status=status.HTTP_400_BAD_REQUEST, data={"detail": "User's not registered for this course"})
-        return Response(current_sessions, status=status.HTTP_200_OK)
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST,
+                data={"detail": "User's not registered for this course"},
+            )
+        return Response(
+            CourseSessionSerializer(current_sessions, many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
 
 class ValidateDiscountView(APIView):
     permission_classes = [permissions.IsAuthenticated]

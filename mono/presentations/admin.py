@@ -14,6 +14,27 @@ from .models import (
 from .services import set_status_approved, set_status_rejected, set_status_final
 
 
+class TinyMCEWidget(forms.Textarea):
+    """TinyMCE-backed textarea for trusted content authored in the admin."""
+
+    class Media:
+        js = (
+            "https://cdn.jsdelivr.net/npm/tinymce@7.9.1/tinymce.min.js",
+            "presentations/js/tinymce_admin.js",
+        )
+
+    def __init__(self, attrs=None):
+        attrs = dict(attrs or {})
+        attrs["class"] = f"{attrs.get('class', '')} js-tinymce".strip()
+        attrs.setdefault("rows", 20)
+        super().__init__(attrs)
+
+
+class CourseSessionAdminForm(forms.ModelForm):
+    class Meta:
+        model = CourseSession
+        fields = "__all__"
+        widgets = {"description": TinyMCEWidget()}
 
 
 class ScheduleInline(admin.TabularInline):
@@ -63,8 +84,6 @@ class CourseAdminForm(forms.ModelForm):
         return cleaned
 
 
-
-
 @admin.register(Course)
 class CourseAdmin(admin.ModelAdmin):
     form = CourseAdminForm
@@ -102,8 +121,15 @@ class CourseAdmin(admin.ModelAdmin):
 
 @admin.register(CourseSession)
 class CourseSessionAdmin(admin.ModelAdmin):
-    list_display = ("course", "start_time", "end_time")
-    search_fields = ("course__name", "course__subtitle")
+    form = CourseSessionAdminForm
+    list_display = ("title", "course")
+    search_fields = (
+        "title",
+        "subtitle",
+        "description",
+        "course__name",
+        "course__subtitle",
+    )
     list_filter = ("course",)
 
 

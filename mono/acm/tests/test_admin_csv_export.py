@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime, time
+from datetime import datetime
 from html import unescape
 from io import StringIO
 from unittest.mock import patch
@@ -185,19 +185,17 @@ class AdminCsvExportTests(TestCase):
         self.assertEqual(rows[1][3], old_user.email)
         self.assertTrue(rows[1][8].startswith("2025-05-10 09:00:00"))
 
-    def test_related_fields_dates_and_times_are_serialized(self):
+    def test_related_course_session_fields_are_serialized(self):
         course = self.make_course("Related course", "related-course")
         CourseSession.objects.create(
             course=course,
-            date=datetime(2026, 9, 1).date(),
-            start_time=time(9, 30),
-            end_time=time(11, 15),
+            title="Opening session",
         )
 
         rows = self.csv_rows(self.export(CourseSession))
 
-        self.assertEqual(rows[0], ["Course", "Start time", "End time"])
-        self.assertEqual(rows[1], ["Related course", "09:30:00", "11:15:00"])
+        self.assertEqual(rows[0], ["Title", "Course"])
+        self.assertEqual(rows[1], ["Opening session", "Related course"])
 
     def test_decimal_values_keep_their_declared_precision(self):
         Competition.objects.create(

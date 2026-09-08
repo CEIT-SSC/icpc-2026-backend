@@ -23,7 +23,7 @@ from acm import error_codes as EC
 from acm.exceptions import CustomAPIException
 from payment.models import Payment
 
-from .admin import CourseAdminForm, RegistrationAdmin
+from .admin import CourseAdminForm, CourseSessionAdminForm, RegistrationAdmin
 from .models import (
     BUNDLE_CATALOG,
     Course,
@@ -671,9 +671,7 @@ class BundlePaymentAndAccessTests(BundleTestMixin, TestCase):
             CourseSession.objects.create(
                 course=member,
                 title=f"Session {index}",
-                date="2026-09-01",
-                start_time=time(17),
-                end_time=time(20),
+                description="<p>Session <strong>notes</strong>.</p>",
             )
         self.assertTrue(
             all(get_course_sessions(self.user, member) is None for member in self.members)
@@ -688,6 +686,27 @@ class BundlePaymentAndAccessTests(BundleTestMixin, TestCase):
 
             self.assertTrue(
                 all(get_course_sessions(self.user, member).count() == 1 for member in self.members)
+            )
+            client = APIClient()
+            client.force_authenticate(self.user)
+            response = client.get(
+                f"/api/presentations/course/{self.members[0].slug}/sessions/"
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                set(response.data[0]),
+                {
+                    "id",
+                    "course",
+                    "title",
+                    "subtitle",
+                    "description",
+                    "recording_link",
+                },
+            )
+            self.assertEqual(
+                response.data[0]["description"],
+                "<p>Session <strong>notes</strong>.</p>",
             )
             self.assertEqual(
                 create_skyroom_link(self.user, self.members[0]),
@@ -926,6 +945,16 @@ class BundleMigrationTests(TestCase):
 
 
 class BundleAdminAndValidationTests(BundleTestMixin, TestCase):
+    def test_course_session_admin_uses_tinymce_for_description(self):
+        widget = CourseSessionAdminForm.base_fields["description"].widget
+
+        self.assertIn("js-tinymce", widget.attrs["class"])
+        self.assertIn("tinymce@7.9.1", widget.media._js[0])
+        self.assertEqual(
+            widget.media._js[1],
+            "presentations/js/tinymce_admin.js",
+        )
+
     def test_registration_admin_supports_bundle_filter_and_reporting(self):
         registration_admin = RegistrationAdmin(Registration, AdminSite())
         self.assertIn("course__bundle_type", registration_admin.list_filter)

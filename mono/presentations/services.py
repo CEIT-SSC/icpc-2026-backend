@@ -732,7 +732,7 @@ def set_status_rejected(
 def get_course_sessions(user: User, course: Course):
     if not _user_has_access_to_course(user, course):
         return None
-    return CourseSession.objects.filter(course=course).values()
+    return CourseSession.objects.filter(course=course)
 
 
 def _user_has_access_to_course(user, course) -> bool:
